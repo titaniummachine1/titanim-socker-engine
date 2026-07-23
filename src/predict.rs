@@ -31,6 +31,18 @@ pub fn predict_ball_path(
     dt: f32,
     max_horizon_s: f32,
 ) -> Vec<BallSample> {
+    predict_ball_path_until_intercept(ball, params, dt, max_horizon_s, &[], 0.0).0
+}
+
+/// Advance until rest/goal **or** earliest candidate touch. Empty candidates → full path.
+pub fn predict_ball_path_until_intercept(
+    ball: &Ball,
+    params: &EngineParams,
+    dt: f32,
+    max_horizon_s: f32,
+    candidates: &[Candidate],
+    reach: f32,
+) -> (Vec<BallSample>, Option<(usize, Intercept)>) {
     let mut current = *ball;
     current.held = false;
     let mut path = vec![BallSample {
@@ -40,19 +52,48 @@ pub fn predict_ball_path(
         end: EndReason::None,
     }];
     if dt <= 0.0 || max_horizon_s <= 0.0 {
-        return path;
+        return (path, None);
     }
 
     let mut t = 0.0;
     while t + dt <= max_horizon_s + 1e-6 {
         let end = step_free_ball(&mut current, params, dt);
         t += dt;
-        path.push(BallSample {
+        let sample = BallSample {
             t,
             pos: current.pos,
             vel: current.vel,
             end,
-        });
+        };
+        path.push(sample);
+
+        if !candidates.is_empty() {
+            let mut best: Option<(usize, Intercept)> = None;
+            for (i, c) in candidates.iter().enumerate() {
+                let dist = c.pos.distance(sample.pos);
+                if dist <= c.speed.max(0.0) * sample.t + reach + 1e-5 {
+                    let hit = Intercept {
+                        t: sample.t,
+                        pos: sample.pos,
+                        arriver_dist: dist,
+                    };
+                    best = Some(match best {
+                        Some((bi, bh))
+                            if bh.t < hit.t
+                                || ((bh.t - hit.t).abs() <= 1e-6
+                                    && bh.arriver_dist <= hit.arriver_dist) =>
+                        {
+                            (bi, bh)
+                        }
+                        _ => (i, hit),
+                    });
+                }
+            }
+            if best.is_some() {
+                return (path, best);
+            }
+        }
+
         if end != EndReason::None || goal_at(current.pos, params) != EndReason::None {
             break;
         }
@@ -60,7 +101,7 @@ pub fn predict_ball_path(
             break;
         }
     }
-    path
+    (path, None)
 }
 
 pub fn earliest_intercept(
@@ -113,30 +154,373 @@ pub fn guaranteed_intercept_horizon(
     truncate_to_guaranteed_intercept(path, candidates, reach).0
 }
 
+/// Deep fallback line just in front of the goal plane.
+pub fn gk_cover_x(own_goal_x: f32, reach: f32) -> f32 {
+    let depth_sign = if own_goal_x > 0.0 { -1.0 } else { 1.0 };
+    own_goal_x + depth_sign * (reach * 0.85).clamp(0.8, 2.5)
+}
+
+#[inline]
+fn closer_to_own_goal(a: Vec2, b: Vec2, own_goal_x: f32) -> bool {
+    (a.x - own_goal_x).abs() < (b.x - own_goal_x).abs()
+}
+
+#[inline]
+fn clamp_own_half_x(x: f32, own_goal_x: f32) -> f32 {
+    if own_goal_x > 0.0 {
+        x.max(0.0)
+    } else {
+        x.min(0.0)
+    }
+}
+
+/// Clamp cover onto own half, not into the goal, and not leaving a runner behind.
+fn clamp_gk_cover(mut g: Vec2, threats: &[Vec2], own_goal_x: f32, reach: f32) -> Vec2 {
+    let deep = gk_cover_x(own_goal_x, reach);
+    g.x = clamp_own_half_x(g.x, own_goal_x);
+    if own_goal_x > 0.0 {
+        g.x = g.x.min(deep);
+    } else {
+        g.x = g.x.max(deep);
+    }
+    for &t in threats {
+        if closer_to_own_goal(t, g, own_goal_x) {
+            if own_goal_x > 0.0 {
+                g.x = g.x.max(t.x);
+            } else {
+                g.x = g.x.min(t.x);
+            }
+        }
+    }
+    g.x = clamp_own_half_x(g.x, own_goal_x);
+    g
+}
+
+/// Angle-bisector unit from attacker toward the goal mouth (posts L/R).
+fn goal_bisector(attacker: Vec2, own_goal_x: f32, goal_half_width: f32) -> Option<Vec2> {
+    let left = Vec2::new(own_goal_x, goal_half_width);
+    let right = Vec2::new(own_goal_x, -goal_half_width);
+    let to_l = left - attacker;
+    let to_r = right - attacker;
+    let len_l = to_l.length();
+    let len_r = to_r.length();
+    if len_l < 1e-4 || len_r < 1e-4 {
+        return None;
+    }
+    let sum = to_l / len_l + to_r / len_r;
+    let sum_len = sum.length();
+    if sum_len < 1e-4 {
+        return None;
+    }
+    Some(sum / sum_len)
+}
+
+/// Max-kick projectile from `origin` toward `aim` using real slide friction.
+fn max_kick_path(origin: Vec2, aim: Vec2, params: &EngineParams) -> Vec<BallSample> {
+    let dir = (aim - origin).normalize_or_zero();
+    let (horiz, lift) = kick_launch_speeds(1.0, params);
+    let ball = Ball {
+        pos: origin,
+        vel: dir * horiz,
+        height: params.ball_rest_height,
+        vel_y: lift,
+        held: false,
+    };
+    predict_ball_path(&ball, params, FIXED_DT, 4.0)
+}
+
+/// Shrink post aims toward mouth center until a max-kick can still enter the goal.
+fn reachable_post_aims(
+    origin: Vec2,
+    own_goal_x: f32,
+    goal_half_width: f32,
+    params: &EngineParams,
+) -> (Vec2, Vec2) {
+    let mut half = goal_half_width.max(0.5);
+    for _ in 0..8 {
+        let left = Vec2::new(own_goal_x, half);
+        let right = Vec2::new(own_goal_x, -half);
+        let path_l = max_kick_path(origin, left, params);
+        let path_r = max_kick_path(origin, right, params);
+        let ok_l = path_l
+            .last()
+            .is_some_and(|s| matches!(s.end, EndReason::GoalHome | EndReason::GoalAway));
+        let ok_r = path_r
+            .last()
+            .is_some_and(|s| matches!(s.end, EndReason::GoalHome | EndReason::GoalAway));
+        if ok_l && ok_r {
+            return (left, right);
+        }
+        half = (half * 0.75).max(0.75);
+    }
+    (
+        Vec2::new(own_goal_x, half),
+        Vec2::new(own_goal_x, -half),
+    )
+}
+
+/// Half-angle α = θ/2 of the shot cone ∠LAR at the attacker.
+fn shot_cone_half_angle(attacker: Vec2, left: Vec2, right: Vec2) -> Option<f32> {
+    let to_l = left - attacker;
+    let to_r = right - attacker;
+    let len_l = to_l.length();
+    let len_r = to_r.length();
+    if len_l < 1e-4 || len_r < 1e-4 {
+        return None;
+    }
+    let cos = (to_l / len_l).dot(to_r / len_r).clamp(-1.0, 1.0);
+    let theta = cos.acos();
+    Some((0.5 * theta).max(1e-4))
+}
+
+/// Closed-form deepest bisector cover under constant ball/GK speeds:
+///
+/// `d_max = r / (sin(α) − (v_g/v_b) cos(α))`
+///
+/// Returns `None` when the denominator ≤ 0 (GK is fast enough that the
+/// constant-speed model places no forward limit — caller should sit deep).
+pub fn gk_analytical_cover_depth(alpha: f32, reach: f32, vg: f32, vb: f32) -> Option<f32> {
+    let vb = vb.max(1e-3);
+    let vg = vg.max(0.0);
+    let denom = alpha.sin() - (vg / vb) * alpha.cos();
+    if denom <= 1e-5 {
+        return None;
+    }
+    Some((reach.max(0.05) / denom).max(0.0))
+}
+
+/// Max-kick intercept cover along the shot-cone bisector.
+///
+/// Uses the analytical constant-speed model
+/// `d ≤ r / (sin α − (v_g/v_b) cos α)` with `v_b` = max planar kick launch
+/// and `α` = half the (possibly shrunk) post cone. Clamped to own half / deep
+/// goal line. This is the deepest stand that can still beat worst-case L/R
+/// edge shots when the GK only needs lateral travel `d sin α`.
+pub fn gk_intercept_cover(
+    attacker: Vec2,
+    own_goal_x: f32,
+    goal_half_width: f32,
+    params: &EngineParams,
+    gk_speed: f32,
+) -> Vec2 {
+    let reach = params.interact_radius;
+    let deep_x = gk_cover_x(own_goal_x, reach);
+    let fallback = Vec2::new(deep_x, attacker.y.clamp(-goal_half_width, goal_half_width));
+
+    let Some(b) = goal_bisector(attacker, own_goal_x, goal_half_width) else {
+        return fallback;
+    };
+    let to_goal = (own_goal_x - attacker.x).signum();
+    if b.x * to_goal <= 0.0 {
+        return fallback;
+    }
+
+    let (aim_l, aim_r) = reachable_post_aims(attacker, own_goal_x, goal_half_width, params);
+    let Some(alpha) = shot_cone_half_angle(attacker, aim_l, aim_r) else {
+        return fallback;
+    };
+
+    let (vb, _) = kick_launch_speeds(1.0, params);
+    let vg = gk_speed.max(0.1);
+    let d_deep = if b.x.abs() > 1e-4 {
+        ((deep_x - attacker.x) / b.x).max(0.0)
+    } else {
+        attacker.distance(Vec2::new(deep_x, attacker.y))
+    };
+
+    let d = match gk_analytical_cover_depth(alpha, reach, vg, vb) {
+        Some(d_max) => d_max.min(d_deep),
+        // Denom ≤ 0 → constant-speed model says "arbitrarily deep" is fine.
+        None => d_deep,
+    };
+
+    let mut g = attacker + b * d;
+    g.x = clamp_own_half_x(g.x, own_goal_x);
+    if own_goal_x > 0.0 {
+        g.x = g.x.min(deep_x);
+    } else {
+        g.x = g.x.max(deep_x);
+    }
+    g
+}
+
+/// Deepest safe cover + tackle only when carrier enters interact reach.
+/// Never steps past cover just to attempt a tackle.
+pub fn gk_cover_press_target(
+    me: Vec2,
+    carrier: Vec2,
+    _carrier_vel: Vec2,
+    own_goal_x: f32,
+    goal_half_width: f32,
+    params: &EngineParams,
+    gk_speed: f32,
+) -> (Vec2, bool) {
+    let reach = params.interact_radius;
+    let cover = gk_intercept_cover(carrier, own_goal_x, goal_half_width, params, gk_speed);
+    let try_tackle = me.distance(carrier) <= reach * 1.2;
+    (cover, try_tackle)
+}
+
+/// Classic cone-bisector cover (O(1) geometric fallback).
+/// Prefer [`gk_intercept_cover`] for live GK standing.
+pub fn gk_cone_bisector_cover(
+    attacker: Vec2,
+    own_goal_x: f32,
+    goal_half_width: f32,
+    r: f32,
+) -> Vec2 {
+    let Some(b) = goal_bisector(attacker, own_goal_x, goal_half_width) else {
+        return Vec2::new(gk_cover_x(own_goal_x, r), 0.0);
+    };
+    let left = Vec2::new(own_goal_x, goal_half_width);
+    let right = Vec2::new(own_goal_x, -goal_half_width);
+    let hat_l = (left - attacker).normalize_or_zero();
+    let hat_r = (right - attacker).normalize_or_zero();
+    let cos = hat_l.dot(hat_r).clamp(-1.0, 1.0);
+    let theta = cos.acos();
+    let half = (0.5 * theta).max(1e-4);
+    let d = (r.max(0.05) / half.tan()).max(0.0);
+
+    let mut g = attacker + b * d;
+    let to_goal = (own_goal_x - attacker.x).signum();
+    if (g.x - own_goal_x) * to_goal >= 0.0 {
+        let deep = gk_cover_x(own_goal_x, r);
+        let t = if b.x.abs() > 1e-4 {
+            (deep - attacker.x) / b.x
+        } else {
+            0.0
+        };
+        g = attacker + b * t.max(0.0);
+    }
+    g
+}
+
 pub fn gk_cover_point(
     threat: Vec2,
     own_goal_x: f32,
     goal_half_width: f32,
-    reach: f32,
+    params: &EngineParams,
+    gk_speed: f32,
 ) -> Vec2 {
-    let left = Vec2::new(own_goal_x, goal_half_width);
-    let right = Vec2::new(own_goal_x, -goal_half_width);
-    let depth_sign = if own_goal_x > 0.0 { -1.0 } else { 1.0 };
-    let cover_x = own_goal_x + depth_sign * (reach * 0.85).clamp(0.8, 2.5);
-    let z_at = |post: Vec2| {
-        let dx = post.x - threat.x;
-        if dx.abs() < 1e-4 {
-            post.y
-        } else {
-            let u = (cover_x - threat.x) / dx;
-            threat.y + (post.y - threat.y) * u
+    gk_intercept_cover(threat, own_goal_x, goal_half_width, params, gk_speed)
+}
+
+/// Multi-threat weighted blend of intercept covers + midfield / behind clamps.
+pub fn gk_cover_from_threats(
+    ball: Vec2,
+    threats: &[Vec2],
+    carrier: Option<Vec2>,
+    gk_now: Vec2,
+    own_goal_x: f32,
+    goal_half_width: f32,
+    params: &EngineParams,
+    gk_speed: f32,
+    scale_m: f32,
+) -> Vec2 {
+    let reach = params.interact_radius;
+    let scale = scale_m.max(0.5);
+    let mut acc = Vec2::ZERO;
+    let mut wsum = 0.0;
+    let mut best_w = 0.0;
+    let mut best_t = ball;
+    for &t in threats {
+        let mut w = (-t.distance(ball) / scale).exp();
+        if let Some(c) = carrier {
+            if t.distance(c) < 0.75 {
+                w *= 2.5;
+            }
+            if closer_to_own_goal(t, gk_now, own_goal_x) {
+                w *= 4.0;
+            }
         }
+        if w > best_w {
+            best_w = w;
+            best_t = t;
+        }
+        if w < 1e-4 {
+            continue;
+        }
+        acc += gk_intercept_cover(t, own_goal_x, goal_half_width, params, gk_speed) * w;
+        wsum += w;
+    }
+    {
+        let w = 0.35;
+        acc += gk_intercept_cover(ball, own_goal_x, goal_half_width, params, gk_speed) * w;
+        wsum += w;
+    }
+    let raw = if wsum < 1e-6 {
+        gk_intercept_cover(best_t, own_goal_x, goal_half_width, params, gk_speed)
+    } else {
+        acc / wsum
     };
-    Vec2::new(
-        cover_x,
-        (0.5 * (z_at(left).min(z_at(right)) + z_at(left).max(z_at(right))))
-            .clamp(-goal_half_width, goal_half_width),
-    )
+    clamp_gk_cover(raw, threats, own_goal_x, reach)
+}
+
+/// Highest-weight threat (closest to ball, exp).
+pub fn primary_ball_threat(ball: Vec2, threats: &[Vec2], scale_m: f32) -> Option<Vec2> {
+    let scale = scale_m.max(0.5);
+    let mut best: Option<(f32, Vec2)> = None;
+    for &t in threats {
+        let w = (-t.distance(ball) / scale).exp();
+        best = Some(match best {
+            Some((bw, bp)) if bw >= w => (bw, bp),
+            _ => (w, t),
+        });
+    }
+    best.map(|(_, p)| p)
+}
+
+/// Preemptive cut: if `threat` shoots at either post / centre now, where can
+/// the GK reach the ball first? Returns earliest reachable cut point.
+pub fn gk_cut_possible_shot(
+    me: Vec2,
+    threat: Vec2,
+    own_goal_x: f32,
+    goal_half_width: f32,
+    sprint: f32,
+    params: &EngineParams,
+) -> Option<Vec2> {
+    let (horiz, lift) = kick_launch_speeds(0.85, params);
+    let reach = params.interact_radius;
+    let targets = [
+        Vec2::new(own_goal_x, goal_half_width * 0.92),
+        Vec2::new(own_goal_x, -goal_half_width * 0.92),
+        Vec2::new(own_goal_x, goal_half_width * 0.40),
+        Vec2::new(own_goal_x, -goal_half_width * 0.40),
+        Vec2::new(own_goal_x, 0.0),
+    ];
+    let toward = (own_goal_x - threat.x).signum();
+    let mut best: Option<(f32, Vec2)> = None;
+    for target in targets {
+        let dir = (target - threat).normalize_or_zero();
+        if dir.length_squared() < 1e-6 || dir.x * toward <= 0.05 {
+            continue;
+        }
+        let ball = Ball {
+            pos: threat + dir * 0.2,
+            vel: dir * horiz,
+            height: params.ball_rest_height,
+            vel_y: lift,
+            held: false,
+        };
+        let path = predict_ball_path(&ball, params, FIXED_DT, 2.2);
+        if let Some(hit) = earliest_intercept(me, sprint, &path, reach) {
+            // Must cut before the ball reaches the goal mouth plane.
+            let goal_t = path
+                .iter()
+                .find(|s| (s.pos.x - own_goal_x).abs() <= 0.6)
+                .map(|s| s.t)
+                .unwrap_or(f32::MAX);
+            if hit.t + 1e-3 < goal_t {
+                let score = -hit.t;
+                best = Some(match best {
+                    Some((bs, bp)) if bs >= score => (bs, bp),
+                    _ => (score, hit.pos),
+                });
+            }
+        }
+    }
+    best.map(|(_, p)| p)
 }
 
 pub fn path_interceptable_near(
@@ -203,6 +587,58 @@ pub fn best_safe_clear_dir(
         if let Some(last) = path.last() {
             score += (last.pos.x - origin.x) * attack_sign * 0.15;
             score += last.pos.y.abs() * 0.05;
+        }
+        if score > best_score {
+            best_score = score;
+            best = direction;
+        }
+    }
+    best
+}
+
+/// GK buy-time clear: maximize how far the ball travels upfield.
+/// Prefer not being sniped inside `safe_radius`, but distance wins — even if an
+/// opponent eventually collects it deeper, the delay is the point.
+pub fn best_long_clear_dir(
+    origin: Vec2,
+    attack_sign: f32,
+    opponents: &[Candidate],
+    charge: f32,
+    params: &EngineParams,
+    safe_radius: f32,
+) -> Vec2 {
+    let (horizontal, lift) = kick_launch_speeds(charge.clamp(0.7, 1.0), params);
+    let candidates = [
+        Vec2::new(attack_sign, 0.95).normalize_or_zero(),
+        Vec2::new(attack_sign, -0.95).normalize_or_zero(),
+        Vec2::new(attack_sign, 0.55).normalize_or_zero(),
+        Vec2::new(attack_sign, -0.55).normalize_or_zero(),
+        Vec2::new(attack_sign, 0.25).normalize_or_zero(),
+        Vec2::new(attack_sign, -0.25).normalize_or_zero(),
+        Vec2::new(attack_sign, 0.0),
+    ];
+    let mut best = candidates[0];
+    let mut best_score = f32::NEG_INFINITY;
+    for direction in candidates {
+        let ball = Ball {
+            pos: origin + direction * 0.15,
+            vel: direction * horizontal,
+            height: params.ball_rest_height,
+            vel_y: lift,
+            held: false,
+        };
+        let path = predict_ball_path(&ball, params, FIXED_DT, 3.5);
+        let unsafe_near =
+            path_interceptable_near(&path, opponents, params.interact_radius, origin, safe_radius);
+        let mut score = 0.0;
+        if let Some(last) = path.last() {
+            // Primary: meters gained toward opponent goal.
+            score += (last.pos.x - origin.x) * attack_sign * 4.0;
+            score += last.pos.distance(origin) * 1.5;
+            score += last.pos.y.abs() * 0.2; // diagonal hang-time bias
+        }
+        if !unsafe_near {
+            score += 8.0; // soft preference only
         }
         if score > best_score {
             best_score = score;
@@ -339,8 +775,52 @@ mod tests {
 
     #[test]
     fn gk_cover_tracks_threat_side() {
-        let point = gk_cover_point(Vec2::new(0.0, 3.0), 39.5, 6.0, 1.75);
+        let params = EngineParams::default();
+        let point = gk_cover_point(Vec2::new(0.0, 3.0), 39.5, 6.0, &params, 8.0);
         assert!(point.y > 0.0);
+    }
+
+    #[test]
+    fn gk_intercept_cover_not_glued_to_midfield_attacker() {
+        let params = EngineParams::default();
+        let a = Vec2::new(0.0, 3.0);
+        let g = gk_intercept_cover(a, 39.5, 6.0, &params, 8.0);
+        assert!(g.x > a.x + 6.0, "g={g:?}");
+    }
+
+    #[test]
+    fn gk_cone_bisector_is_on_centerline_for_central_attacker() {
+        let a = Vec2::new(20.0, 0.0);
+        let r = 1.75;
+        let g = gk_cone_bisector_cover(a, 39.5, 6.0, r);
+        assert!(g.y.abs() < 1e-3, "y={}", g.y);
+        assert!(g.x > a.x && g.x < 39.5, "x={}", g.x);
+        let left = Vec2::new(39.5, 6.0);
+        let right = Vec2::new(39.5, -6.0);
+        let hl = (left - a).normalize();
+        let hr = (right - a).normalize();
+        let theta = hl.dot(hr).clamp(-1.0, 1.0).acos();
+        let d = r / (0.5 * theta).tan();
+        assert!((g.distance(a) - d).abs() < 1e-2, "dist={} d={}", g.distance(a), d);
+    }
+
+    #[test]
+    fn gk_cover_never_past_midfield() {
+        let params = EngineParams::default();
+        let ball = Vec2::new(-10.0, 0.0);
+        let threats = [Vec2::new(-8.0, 1.0)];
+        let g = gk_cover_from_threats(
+            ball,
+            &threats,
+            None,
+            Vec2::new(30.0, 0.0),
+            39.5,
+            6.0,
+            &params,
+            8.0,
+            4.0,
+        );
+        assert!(g.x >= 0.0, "x={}", g.x);
     }
 
     #[test]

@@ -6,11 +6,12 @@
 use crate::ball::Ball;
 use crate::params::EngineParams;
 use crate::predict::{
-    best_forward_pass_dir, best_safe_clear_dir, best_shot_dir_evading, earliest_intercept,
-    gk_cover_point, predict_ball_path, truncate_to_guaranteed_intercept, Candidate,
+    best_forward_pass_dir, best_long_clear_dir, best_shot_dir_evading, earliest_intercept,
+    gk_cover_press_target, predict_ball_path, predict_ball_path_until_intercept,
+    truncate_to_guaranteed_intercept, Candidate,
 };
 use crate::sensors::TeamSnapshot;
-use crate::types::{PlayerCommand, PlayerId, TeamCommands, Vec2};
+use crate::types::{PlayerCommand, PlayerId, TeamCommands, Vec2, FIXED_DT};
 
 const SPRINT_SPEED: f32 = 8.0;
 const HOLD_PROXY: f32 = 0.55;
@@ -64,27 +65,13 @@ impl TitaniumBrain {
             let charge = snap.shot_charge[index].clamp(0.0, 1.0);
             let command = match Self::role(id) {
                 Role::Attacker => self.think_attacker(snap, me, has_ball, charge, &opponents),
-                Role::LackeyLeft => self.think_lackey(
-                    snap,
-                    me,
-                    true,
-                    has_ball,
-                    charge,
-                    carrier,
-                    &opponents,
-                ),
-                Role::LackeyRight => self.think_lackey(
-                    snap,
-                    me,
-                    false,
-                    has_ball,
-                    charge,
-                    carrier,
-                    &opponents,
-                ),
-                Role::Goalkeeper => {
-                    self.think_gk(snap, me, has_ball, charge, &opponents)
+                Role::LackeyLeft => {
+                    self.think_lackey(snap, me, true, has_ball, charge, carrier, &opponents)
                 }
+                Role::LackeyRight => {
+                    self.think_lackey(snap, me, false, has_ball, charge, carrier, &opponents)
+                }
+                Role::Goalkeeper => self.think_gk(snap, me, has_ball, charge, &opponents),
             };
             if self.debug && self.tick % 25 == 0 {
                 eprintln!(
@@ -265,10 +252,11 @@ impl TitaniumBrain {
                 pos: me,
                 speed: SPRINT_SPEED,
             }];
-            let target = truncate_to_guaranteed_intercept(&path, &candidate, self.params.interact_radius)
-                .1
-                .map(|(_, hit)| hit.pos)
-                .unwrap_or(snap.ball_pos);
+            let target =
+                truncate_to_guaranteed_intercept(&path, &candidate, self.params.interact_radius)
+                    .1
+                    .map(|(_, hit)| hit.pos)
+                    .unwrap_or(snap.ball_pos);
             return PlayerCommand {
                 move_to: target,
                 sprint: true,
@@ -278,6 +266,68 @@ impl TitaniumBrain {
 
         let pressure = Self::pressure_radius(me, opponents);
         let threat = Self::nearest_opp(me, opponents);
+
+        // 1v1 finisher: ignore parked wide corners; carry wide, then aim far
+        // post. Keep the open-play branch below unchanged.
+        let near_central = opponents
+            .iter()
+            .filter(|p| me.distance(**p) < 18.0 && p.y.abs() < 14.0)
+            .count();
+        let goal_line = sign * self.params.goal_line_x.abs();
+        let gk_like = threat
+            .map(|t| (t.x - goal_line).abs() < 10.0 && t.y.abs() < 10.0)
+            .unwrap_or(false);
+        if near_central <= 1 || gk_like {
+            let threat_dist = threat.map(|t| me.distance(t)).unwrap_or(999.0);
+            let dist_goal = (goal_line - me.x).abs();
+            let wide_z = self.side_bias * 7.0;
+            let far_post_z = -self.side_bias * self.params.goal_half_width * 0.95;
+            let wide_enough = (me.y - wide_z).abs() <= 2.5;
+            let can_finish = wide_enough && dist_goal < 11.0;
+            let panic = threat_dist < self.params.interact_radius * 1.15;
+            let far_aim = (Vec2::new(goal_line, far_post_z) - me).normalize_or_zero();
+            let mut shot_dir = if can_finish || panic {
+                let evade =
+                    best_shot_dir_evading(me, sign, opponents, charge.max(0.85), &self.params);
+                (far_aim * 0.55 + evade * 0.45).normalize_or_zero()
+            } else {
+                far_aim
+            };
+            if !snap.is_home {
+                let mut d = shot_dir.normalize_or_zero();
+                if d.x < -0.55 && d.y > -0.55 {
+                    let y_sign = if far_post_z >= 0.0 { 1.0 } else { -1.0 };
+                    d = Vec2::new(-0.50, y_sign * (0.75f32).sqrt());
+                }
+                shot_dir = d;
+            }
+            let walk = if !wide_enough {
+                Vec2::new(me.x + sign * 5.0, wide_z)
+            } else if !can_finish {
+                Vec2::new(me.x + sign * 8.0, wide_z)
+            } else if panic {
+                self.anti_tackle_walk(me, goal_dir, threat, far_post_z.signum())
+            } else {
+                me + shot_dir * 5.0
+            };
+            let release_at: f32 = if panic && charge >= 0.40 {
+                0.30
+            } else if !can_finish {
+                1.05
+            } else {
+                0.75
+            };
+            if charge >= 0.20 && (can_finish || panic) {
+                self.flick_dir = Some(shot_dir);
+            }
+            let direction = self.flick_dir.unwrap_or(shot_dir);
+            let command = Self::flick_shot(me, walk, direction, charge, release_at);
+            if !command.interact {
+                self.flick_dir = None;
+            }
+            return command;
+        }
+
         let mut shot = self.flick_dir;
         if shot.is_none() || charge < 0.35 {
             if pressure > 5.0 {
@@ -299,16 +349,10 @@ impl TitaniumBrain {
                 }
             }
             if shot.is_none() {
-                let direction = best_shot_dir_evading(
-                    me,
-                    sign,
-                    opponents,
-                    charge.max(0.55),
-                    &self.params,
-                );
-                shot = Some(
-                    (direction + Vec2::new(0.0, self.side_bias * 0.12)).normalize_or_zero(),
-                );
+                let direction =
+                    best_shot_dir_evading(me, sign, opponents, charge.max(0.55), &self.params);
+                shot =
+                    Some((direction + Vec2::new(0.0, self.side_bias * 0.12)).normalize_or_zero());
             }
         }
 
@@ -405,7 +449,8 @@ impl TitaniumBrain {
         }
 
         let path = self.ball_path(snap, 2.0);
-        if let Some(hit) = earliest_intercept(me, SPRINT_SPEED, &path, self.params.interact_radius) {
+        if let Some(hit) = earliest_intercept(me, SPRINT_SPEED, &path, self.params.interact_radius)
+        {
             let distance = me.distance(hit.pos);
             PlayerCommand {
                 move_to: hit.pos,
@@ -442,11 +487,11 @@ impl TitaniumBrain {
             .collect();
 
         if has_ball {
-            let clear = best_safe_clear_dir(
+            let clear = best_long_clear_dir(
                 me,
                 sign,
                 &opponent_candidates,
-                charge.max(0.5),
+                charge.max(0.7),
                 &self.params,
                 18.0,
             );
@@ -473,55 +518,84 @@ impl TitaniumBrain {
         }
         self.flick_dir = None;
 
-        let threat = if snap.opp_has_ball {
+        // Loose / in-motion: abandon cover — chase first touch on truncated path.
+        if snap.ball_loose || (!snap.opp_has_ball && snap.ball_vel.length_squared() > 0.25) {
+            let mut cands = opponent_candidates;
+            cands.push(Candidate {
+                pos: me,
+                speed: SPRINT_SPEED,
+            });
+            for &pos in &snap.team_pos {
+                cands.push(Candidate {
+                    pos,
+                    speed: SPRINT_SPEED,
+                });
+            }
+            let ball = Ball {
+                pos: snap.ball_pos,
+                vel: snap.ball_vel,
+                height: self.params.ball_rest_height,
+                vel_y: 0.0,
+                held: false,
+            };
+            let (path, first) = predict_ball_path_until_intercept(
+                &ball,
+                &self.params,
+                FIXED_DT,
+                3.0,
+                &cands,
+                self.params.interact_radius,
+            );
+            if let Some(hit) =
+                earliest_intercept(me, SPRINT_SPEED, &path, self.params.interact_radius)
+            {
+                let cut = if own_goal_x > 0.0 {
+                    hit.pos.x.max(0.0)
+                } else {
+                    hit.pos.x.min(0.0)
+                };
+                return PlayerCommand {
+                    move_to: Vec2::new(cut, hit.pos.y),
+                    sprint: true,
+                    interact: me.distance(hit.pos) <= self.params.interact_radius * 1.2,
+                };
+            }
+            let fallback = first.map(|(_, h)| h.pos).unwrap_or(snap.ball_pos);
+            return PlayerCommand {
+                move_to: fallback,
+                sprint: true,
+                interact: me.distance(snap.ball_pos) <= self.params.interact_radius * 1.15,
+            };
+        }
+
+        // Held: stand at deepest cover; tackle only if carrier enters reach.
+        let carrier = if snap.opp_has_ball {
             snap.opp_pos
                 .iter()
                 .zip(snap.opp_has.iter())
                 .find_map(|(&position, &has)| has.then_some(position))
-                .unwrap_or(snap.ball_pos)
         } else {
-            snap.ball_pos
+            None
         };
-        let cover = gk_cover_point(
+        let threat = carrier.unwrap_or(snap.ball_pos);
+        let carrier_vel = if snap.opp_has_ball {
+            snap.ball_vel
+        } else {
+            Vec2::ZERO
+        };
+        let (move_to, try_tackle) = gk_cover_press_target(
+            me,
             threat,
+            carrier_vel,
             own_goal_x,
             self.params.goal_half_width,
-            self.params.interact_radius,
+            &self.params,
+            SPRINT_SPEED,
         );
-
-        if snap.ball_loose || snap.ball_vel.length_squared() > 1.0 {
-            let path = self.ball_path(snap, 3.0);
-            let mut candidates = vec![Candidate {
-                pos: me,
-                speed: SPRINT_SPEED,
-            }];
-            candidates.extend(
-                snap.team_pos[..3]
-                    .iter()
-                    .copied()
-                    .map(|pos| Candidate {
-                        pos,
-                        speed: SPRINT_SPEED,
-                    }),
-            );
-            if let Some((index, hit)) =
-                truncate_to_guaranteed_intercept(&path, &candidates, self.params.interact_radius).1
-            {
-                if index == 0 {
-                    return PlayerCommand {
-                        move_to: hit.pos,
-                        sprint: true,
-                        interact: me.distance(hit.pos) <= self.params.interact_radius * 1.2,
-                    };
-                }
-            }
-        }
-
         PlayerCommand {
-            move_to: cover,
-            sprint: me.distance(cover) > 2.0,
-            interact: me.distance(snap.ball_pos) <= self.params.interact_radius * 1.25
-                && (snap.ball_loose || snap.opp_has_ball),
+            move_to,
+            sprint: me.distance(move_to) > 1.5 || try_tackle,
+            interact: try_tackle,
         }
     }
 }
