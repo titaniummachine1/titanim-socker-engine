@@ -1,0 +1,18 @@
+[package]
+name = "titanim-socker-engine"
+version = "0.1.0"
+edition = "2021"
+license = "UNLICENSED"
+description = "Private Titanium soccer decision engine (prediction, GK, attack). Not the match simulator."
+publish = false
+
+[dependencies]
+glam = "0.29"
+serde = { version = "1", features = ["derive"], optional = true }
+
+[features]
+default = []
+serde = ["dep:serde", "glam/serde"]
+
+[dev-dependencies]
+approx = "0.5"
