@@ -13,6 +13,8 @@ pub struct TeamSnapshot {
     pub opp_has_ball: bool,
     pub team_pos: [Vec2; 4],
     pub opp_pos: [Vec2; 4],
+    pub team_stamina: [f32; 4],
+    pub opp_stamina: [f32; 4],
     pub team_has: [bool; 4],
     pub opp_has: [bool; 4],
     pub shot_charge: [f32; 4],
@@ -46,5 +48,79 @@ impl TeamSnapshot {
             }
         }
         None
+    }
+
+    /// Opponent body center for the current carrier.
+    ///
+    /// Prefer explicitly marked opponents; if only the aggregate possession
+    /// bit is available, use the opponent nearest the held ball. The latter
+    /// is still a body position, so the held-ball offset is never used as the
+    /// shot origin.
+    pub fn opponent_carrier_pos(&self) -> Option<Vec2> {
+        let mut best: Option<(f32, Vec2)> = None;
+        for i in 0..4 {
+            if !self.opp_has[i] {
+                continue;
+            }
+            let distance = self.opp_pos[i].distance_squared(self.ball_pos);
+            best = Some(match best {
+                Some((best_distance, best_position)) if best_distance <= distance => {
+                    (best_distance, best_position)
+                }
+                _ => (distance, self.opp_pos[i]),
+            });
+        }
+        if best.is_some() {
+            return best.map(|(_, position)| position);
+        }
+        if !self.opp_has_ball {
+            return None;
+        }
+        for &position in &self.opp_pos {
+            let distance = position.distance_squared(self.ball_pos);
+            best = Some(match best {
+                Some((best_distance, best_position)) if best_distance <= distance => {
+                    (best_distance, best_position)
+                }
+                _ => (distance, position),
+            });
+        }
+        best.map(|(_, position)| position)
+    }
+
+    /// Stamina of the current opponent carrier.
+    ///
+    /// Prefer explicitly marked opponents; if only aggregate possession is
+    /// available, use the opponent nearest the held ball.
+    pub fn opponent_carrier_stamina(&self) -> Option<f32> {
+        let mut best: Option<(f32, f32)> = None;
+        for i in 0..4 {
+            if !self.opp_has[i] {
+                continue;
+            }
+            let distance = self.opp_pos[i].distance_squared(self.ball_pos);
+            best = Some(match best {
+                Some((best_distance, best_stamina)) if best_distance <= distance => {
+                    (best_distance, best_stamina)
+                }
+                _ => (distance, self.opp_stamina[i]),
+            });
+        }
+        if best.is_some() {
+            return best.map(|(_, stamina)| stamina);
+        }
+        if !self.opp_has_ball {
+            return None;
+        }
+        for i in 0..4 {
+            let distance = self.opp_pos[i].distance_squared(self.ball_pos);
+            best = Some(match best {
+                Some((best_distance, best_stamina)) if best_distance <= distance => {
+                    (best_distance, best_stamina)
+                }
+                _ => (distance, self.opp_stamina[i]),
+            });
+        }
+        best.map(|(_, stamina)| stamina)
     }
 }

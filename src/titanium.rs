@@ -7,8 +7,9 @@ use crate::ball::Ball;
 use crate::params::EngineParams;
 use crate::predict::{
     best_forward_pass_dir, best_long_clear_dir, best_shot_dir_evading, earliest_intercept,
-    gk_intercept_cover, predict_ball_path, predict_ball_path_until_intercept,
-    truncate_to_guaranteed_intercept, Candidate,
+    gk_held_cover_and_press, gk_intercept_cover, gk_stand_seals_scoring_extremes,
+    predict_ball_path, predict_ball_path_until_intercept, truncate_to_guaranteed_intercept,
+    Candidate,
 };
 use crate::sensors::TeamSnapshot;
 use crate::types::{PlayerCommand, PlayerId, TeamCommands, Vec2, FIXED_DT};
@@ -55,7 +56,7 @@ impl TitaniumBrain {
     pub fn think(&mut self, snap: &TeamSnapshot) -> TeamCommands {
         self.tick = self.tick.wrapping_add(1);
         let opponents: Vec<Vec2> = snap.opp_pos.to_vec();
-        let carrier = snap.carrier_pos();
+        let team_carrier = snap.carrier_pos();
         let mut output = TeamCommands::default();
 
         for id in PlayerId::ALL {
@@ -66,10 +67,10 @@ impl TitaniumBrain {
             let command = match Self::role(id) {
                 Role::Attacker => self.think_attacker(snap, me, has_ball, charge, &opponents),
                 Role::LackeyLeft => {
-                    self.think_lackey(snap, me, true, has_ball, charge, carrier, &opponents)
+                    self.think_lackey(snap, me, true, has_ball, charge, team_carrier, &opponents)
                 }
                 Role::LackeyRight => {
-                    self.think_lackey(snap, me, false, has_ball, charge, carrier, &opponents)
+                    self.think_lackey(snap, me, false, has_ball, charge, team_carrier, &opponents)
                 }
                 Role::Goalkeeper => self.think_gk(snap, me, has_ball, charge, &opponents),
             };
@@ -518,18 +519,44 @@ impl TitaniumBrain {
         }
         self.flick_dir = None;
 
-        // Opponent holds: go to ball, Interact in range — global stam duel.
+        // Opponent holds: seal from the opponent body center. The held ball is
+        // only the interaction point; its velocity supplies carrier lead.
         if snap.opp_has_ball {
-            let reach = self.params.interact_radius;
-            let in_reach = me.distance(snap.ball_pos) <= reach;
+            let carrier = snap
+                .opponent_carrier_pos()
+                .or_else(|| Self::nearest_opp(snap.ball_pos, opponents))
+                .unwrap_or(snap.ball_pos);
+            let (move_to, try_tackle, _cover) = gk_held_cover_and_press(
+                me,
+                carrier,
+                snap.ball_vel,
+                snap.ball_pos,
+                own_goal_x,
+                self.params.goal_half_width,
+                &self.params,
+                SPRINT_SPEED,
+            );
+            let sealed = gk_stand_seals_scoring_extremes(
+                me,
+                carrier,
+                own_goal_x,
+                self.params.goal_half_width,
+                &self.params,
+                SPRINT_SPEED,
+            );
+            let my_stam = snap.team_stamina[3];
+            let carrier_stam = snap.opponent_carrier_stamina().unwrap_or(1.0);
+            let stam_ok = my_stam > carrier_stam + 1e-4;
+            let try_tackle = try_tackle && stam_ok;
+            let sprint = !sealed && !try_tackle && stam_ok;
             return PlayerCommand {
-                move_to: snap.ball_pos,
-                sprint: true,
-                interact: in_reach,
+                move_to,
+                sprint,
+                interact: try_tackle,
             };
         }
 
-        // Loose / free ball: intercept race.
+        // Loose / free ball: intercept race — sprint to win the race.
         if snap.ball_loose || snap.ball_vel.length_squared() > 0.25 {
             let mut cands = opponent_candidates;
             cands.push(Candidate {
@@ -578,9 +605,22 @@ impl TitaniumBrain {
             };
         }
 
-        // Idle: deepest safe cover.
+        // Idle: deepest safe cover for the opponent body, not its held-ball
+        // offset.
+        let carrier = snap
+            .opponent_carrier_pos()
+            .or_else(|| Self::nearest_opp(snap.ball_pos, opponents))
+            .unwrap_or(snap.ball_pos);
         let cover = gk_intercept_cover(
-            snap.ball_pos,
+            carrier,
+            own_goal_x,
+            self.params.goal_half_width,
+            &self.params,
+            SPRINT_SPEED,
+        );
+        let sealed = gk_stand_seals_scoring_extremes(
+            me,
+            carrier,
             own_goal_x,
             self.params.goal_half_width,
             &self.params,
@@ -588,7 +628,7 @@ impl TitaniumBrain {
         );
         PlayerCommand {
             move_to: cover,
-            sprint: me.distance(cover) > 1.5,
+            sprint: !sealed && me.distance(cover) > 0.35,
             interact: false,
         }
     }
@@ -636,6 +676,8 @@ mod tests {
             opp_has_ball: false,
             team_pos: [Vec2::ZERO; 4],
             opp_pos: [Vec2::new(10.0, 10.0); 4],
+            team_stamina: [1.0; 4],
+            opp_stamina: [1.0; 4],
             team_has: [false; 4],
             opp_has: [false; 4],
             shot_charge: [0.0; 4],
