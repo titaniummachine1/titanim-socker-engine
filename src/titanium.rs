@@ -518,7 +518,7 @@ impl TitaniumBrain {
         }
         self.flick_dir = None;
 
-        // Loose / in-motion: abandon cover — chase first touch on truncated path.
+        // Loose / in-motion: drop cover — pure intercept race.
         if snap.ball_loose || (!snap.opp_has_ball && snap.ball_vel.length_squared() > 0.25) {
             let mut cands = opponent_candidates;
             cands.push(Candidate {
@@ -568,25 +568,11 @@ impl TitaniumBrain {
             };
         }
 
-        // Held: stand at deepest cover; tackle only if carrier enters reach.
-        let carrier = if snap.opp_has_ball {
-            snap.opp_pos
-                .iter()
-                .zip(snap.opp_has.iter())
-                .find_map(|(&position, &has)| has.then_some(position))
-        } else {
-            None
-        };
-        let threat = carrier.unwrap_or(snap.ball_pos);
-        let carrier_vel = if snap.opp_has_ball {
-            snap.ball_vel
-        } else {
-            Vec2::ZERO
-        };
+        // Held: closest safe stand vs legal scoring extremes from the ball.
         let (move_to, try_tackle) = gk_cover_press_target(
             me,
-            threat,
-            carrier_vel,
+            snap.ball_pos,
+            snap.ball_pos,
             own_goal_x,
             self.params.goal_half_width,
             &self.params,
