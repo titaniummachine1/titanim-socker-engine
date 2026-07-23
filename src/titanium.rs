@@ -7,7 +7,7 @@ use crate::ball::Ball;
 use crate::params::EngineParams;
 use crate::predict::{
     best_forward_pass_dir, best_long_clear_dir, best_shot_dir_evading, earliest_intercept,
-    gk_cover_press_target, predict_ball_path, predict_ball_path_until_intercept,
+    gk_intercept_cover, predict_ball_path, predict_ball_path_until_intercept,
     truncate_to_guaranteed_intercept, Candidate,
 };
 use crate::sensors::TeamSnapshot;
@@ -518,8 +518,19 @@ impl TitaniumBrain {
         }
         self.flick_dir = None;
 
-        // Loose / in-motion: drop cover — pure intercept race.
-        if snap.ball_loose || (!snap.opp_has_ball && snap.ball_vel.length_squared() > 0.25) {
+        // Opponent holds: go to ball, Interact in range — global stam duel.
+        if snap.opp_has_ball {
+            let reach = self.params.interact_radius;
+            let in_reach = me.distance(snap.ball_pos) <= reach;
+            return PlayerCommand {
+                move_to: snap.ball_pos,
+                sprint: true,
+                interact: in_reach,
+            };
+        }
+
+        // Loose / free ball: intercept race.
+        if snap.ball_loose || snap.ball_vel.length_squared() > 0.25 {
             let mut cands = opponent_candidates;
             cands.push(Candidate {
                 pos: me,
@@ -538,17 +549,16 @@ impl TitaniumBrain {
                 vel_y: 0.0,
                 held: false,
             };
+            let reach = self.params.interact_radius;
             let (path, first) = predict_ball_path_until_intercept(
                 &ball,
                 &self.params,
                 FIXED_DT,
                 3.0,
                 &cands,
-                self.params.interact_radius,
+                reach,
             );
-            if let Some(hit) =
-                earliest_intercept(me, SPRINT_SPEED, &path, self.params.interact_radius)
-            {
+            if let Some(hit) = earliest_intercept(me, SPRINT_SPEED, &path, reach) {
                 let cut = if own_goal_x > 0.0 {
                     hit.pos.x.max(0.0)
                 } else {
@@ -557,21 +567,19 @@ impl TitaniumBrain {
                 return PlayerCommand {
                     move_to: Vec2::new(cut, hit.pos.y),
                     sprint: true,
-                    interact: me.distance(hit.pos) <= self.params.interact_radius * 1.2,
+                    interact: me.distance(hit.pos) <= reach,
                 };
             }
             let fallback = first.map(|(_, h)| h.pos).unwrap_or(snap.ball_pos);
             return PlayerCommand {
                 move_to: fallback,
                 sprint: true,
-                interact: me.distance(snap.ball_pos) <= self.params.interact_radius * 1.15,
+                interact: me.distance(snap.ball_pos) <= reach,
             };
         }
 
-        // Held: closest safe stand vs legal scoring extremes from the ball.
-        let (move_to, try_tackle) = gk_cover_press_target(
-            me,
-            snap.ball_pos,
+        // Idle: deepest safe cover.
+        let cover = gk_intercept_cover(
             snap.ball_pos,
             own_goal_x,
             self.params.goal_half_width,
@@ -579,9 +587,9 @@ impl TitaniumBrain {
             SPRINT_SPEED,
         );
         PlayerCommand {
-            move_to,
-            sprint: me.distance(move_to) > 1.5 || try_tackle,
-            interact: try_tackle,
+            move_to: cover,
+            sprint: me.distance(cover) > 1.5,
+            interact: false,
         }
     }
 }
