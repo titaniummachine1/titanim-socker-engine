@@ -321,8 +321,24 @@ impl TitaniumBrain {
         } else {
             self.side_bias
         };
-        let walk = self.anti_tackle_walk(me, goal_dir, threat, preferred_side);
-        let release_at = if pressure > 5.0 { 0.55 } else { 0.92 };
+
+        // Finishing: drive at goal when the nearest threat is loose / deep (typical
+        // 1v1 vs GK). Only hard-orbit when a tackler is close.
+        let threat_dist = threat.map(|t| me.distance(t)).unwrap_or(f32::INFINITY);
+        // Only "drive and flick early" when truly open (far lone threat / GK).
+        let open_look = pressure > 14.0 && threat_dist > 16.0;
+        let walk = if open_look {
+            me + goal_dir * 7.0 + Vec2::new(0.0, preferred_side * 2.0)
+        } else {
+            self.anti_tackle_walk(me, goal_dir, threat, preferred_side)
+        };
+        let release_at = if open_look {
+            0.68
+        } else if pressure > 5.0 {
+            0.55
+        } else {
+            0.88
+        };
         let command = Self::flick_shot(me, walk, shot_dir, charge, release_at);
         if !command.interact {
             self.flick_dir = None;
