@@ -795,11 +795,19 @@ def gk_policy(
 
     # When the ball is claimable (nearby / loose toward us), step onto it so
     # Interact can fire — do not stay glued to a cover point and let it pass.
+    #
+    # A genuine chase (not already in interact range) targets the ball's
+    # predicted path, not its live position — chasing live position is a
+    # pure-pursuit curve that bleeds ground to any ball with real velocity.
+    # Once it's already `nearby` there's nothing left to lead, so that case
+    # keeps the raw ball position.
     nearby = SoccerGetBool("Is Ball Nearby Team Player 4")
     closest_gk = SoccerGetBool("Is Team Player 4 Closest Teammate to Ball")
+    meet_point_gk = predict_ball_meet_point(gk, ball, ball_vel, WALK_SPEED)
+    chase_target_gk = ConditionalSetVector3(nearby, ball, meet_point_gk)
     go_to_ball = Or(And(loose, closest_gk), And(nearby, Not(has_ball)))
     chase_ok = Or(nearby, seals(gk))
-    move = ConditionalSetVector3(And(go_to_ball, chase_ok), ball, move)
+    move = ConditionalSetVector3(And(go_to_ball, chase_ok), chase_target_gk, move)
     move = ConditionalSetVector3(And(nearby, Not(has_ball)), ball, move)
 
     # The keeper never crosses midfield, however tempting the press or a
@@ -944,9 +952,15 @@ def main() -> None:
         # every duel, and sprinting is the only drain), so spending it on an
         # uncontested reception is pure waste — exactly what let a fresher
         # opponent tackle us straight back after a hard-won interception.
-        meet_point = predict_ball_meet_point(me, ball, ball_vel, WALK_SPEED)
+        # Contested was inverted: it's the actual race, so it needs the lead
+        # point most, at the speed we'll really be moving (sprint, since
+        # that's what `sprint` below sets for this branch) — chasing live
+        # position here was bleeding ground to the ball in exactly the case
+        # where winning the race matters most.
+        meet_point_walk = predict_ball_meet_point(me, ball, ball_vel, WALK_SPEED)
+        meet_point_sprint = predict_ball_meet_point(me, ball, ball_vel, SPRINT_SPEED)
         contested = CompareFloats(nearest_opponent_dist(opponents, ball), Distance(me, ball) * Float(1.3), "<=")
-        loose_target = ConditionalSetVector3(contested, ball, meet_point)
+        loose_target = ConditionalSetVector3(contested, meet_point_sprint, meet_point_walk)
         move = ConditionalSetVector3(And(loose, closest), loose_target, move)
         sprint = And(loose, And(closest, contested))
         SoccerController(slot, move, sprint, player_interact(slot, has, shoot_now))
