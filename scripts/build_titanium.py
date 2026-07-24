@@ -635,6 +635,37 @@ def carrier_lead(gk, carrier, ball, cover_now, charge):
     return carrier + heading * (Float(CARRIER_SPEED) * lead_t)
 
 
+@cache
+def predict_ball_meet_point(me, ball, ball_vel, speed):
+    """Where to walk to meet a moving ball, instead of its live position.
+
+    Targeting the ball's current position always lags a moving ball — by the
+    time you arrive, it has moved on, which either stalls you dead in its
+    path waiting for it to arrive or, worse, has you retreating to chase it
+    as it passes. This is a fixed-point pursuit solve (3 refinements): guess
+    a travel time from the straight-line distance, project the ball forward
+    that long, then re-measure distance to the projected point and repeat.
+
+    Deliberately a straight-line extrapolation (no friction decel) — passes
+    are short-range and this is meant to get a receiver moving promptly at
+    a controlled walk, not to nail the exact final rest point.
+    """
+    velocity = Vector3(ball_vel.x, Float(0), ball_vel.z)
+    point = ball
+    for _ in range(3):
+        t = Distance(me, point) / Float(speed)
+        point = ball + velocity * t
+    return point
+
+
+def nearest_opponent_dist(opponents, ball):
+    nearest_d = Distance(opponents[0], ball)
+    for opp in opponents[1:]:
+        d = Distance(opp, ball)
+        nearest_d = ConditionalSetFloat(CompareFloats(d, nearest_d, "<"), d, nearest_d)
+    return nearest_d
+
+
 def gk_policy(
     gk,
     ball,
@@ -661,11 +692,22 @@ def gk_policy(
     cover, seals = gk_cover_stand(ball, team_goal, left_post, right_post, interact_r)
 
     # With ball: clear upfield; do not sprint for the clear walk-up.
+    #
+    # Routed through the same forbidden-cone avoidance the outfielders use
+    # (`safe_walk_target`) rather than a raw walk toward `clear_dir` — a GK
+    # who just won the ball deep in his own box is standing right next to
+    # whoever he took it from, and a blind walk toward the clear direction
+    # can carry him straight past that opponent, handing back an instant
+    # re-tackle a few metres from our own goal (confirmed via
+    # titanium_matchtrace: exactly this sequence conceded a goal at t=36.8s
+    # of an AIA3 match — GK wins the ball at x=-38, walks to clear, gets
+    # retackled by the stationary opponent one tick later, ball walked in).
     clear_dir = SoccerGetVector3("Clear direction from Teammate 4")
-    clear_spot = gk + unit_or_zero(clear_dir) * Float(14)
-    clear_spot = ConditionalSetVector3(
-        IsNull(clear_dir), pos("Opponent Goal Center"), clear_spot
+    clear_target = gk + unit_or_zero(clear_dir) * Float(14)
+    clear_target = ConditionalSetVector3(
+        IsNull(clear_dir), pos("Opponent Goal Center"), clear_target
     )
+    clear_spot = safe_walk_target(gk, ball, clear_target, opponents, r_eff, step=14)
     move = ConditionalSetVector3(has_ball, clear_spot, cover)
 
     # Sprint ONLY to intercept a free ball whose predicted path crosses our
@@ -822,17 +864,25 @@ def main() -> None:
         )
         move = ConditionalSetVector3(And(team_has, Not(has)), support, move)
         move = ConditionalSetVector3(has, carry, move)
-        # Loose ball is nobody's yet — whoever is closest goes and wins it.
-        move = ConditionalSetVector3(And(loose, closest), ball, move)
 
-        # Stamina IS ball retention: a tackle is decided by
-        # `tackler_stamina >= carrier_stamina`, and sprinting is the only
-        # thing that spends stamina. So a full-stamina carrier simply cannot
-        # be dispossessed, and a defender who has been sprinting loses every
-        # duel he starts. Sprint only to win a loose ball we are already
-        # closest to — never while carrying (that would trade the ball for a
-        # little speed), and never merely because the opponent has it.
-        sprint = And(loose, closest)
+        # Loose ball is nobody's yet. Two different situations, not one:
+        #   - our own pass in flight toward this player: no opponent is
+        #     realistically closer, so this is a controlled reception, not a
+        #     scramble. Walk to meet the ball's predicted path instead of
+        #     chasing its live position (which lags a moving ball and either
+        #     stalls the receiver in place or has him trailing it).
+        #   - a genuine 50/50 (opponent clearance, deflection, loose after a
+        #     tackle): an opponent is comparably close, so this needs the
+        #     sprint to actually win the race.
+        # Stamina IS ball retention (tackler_stam >= carrier_stam decides
+        # every duel, and sprinting is the only drain), so spending it on an
+        # uncontested reception is pure waste — exactly what let a fresher
+        # opponent tackle us straight back after a hard-won interception.
+        meet_point = predict_ball_meet_point(me, ball, ball_vel, WALK_SPEED)
+        contested = CompareFloats(nearest_opponent_dist(opponents, ball), Distance(me, ball) * Float(1.3), "<=")
+        loose_target = ConditionalSetVector3(contested, ball, meet_point)
+        move = ConditionalSetVector3(And(loose, closest), loose_target, move)
+        sprint = And(loose, And(closest, contested))
         SoccerController(slot, move, sprint, player_interact(slot, has, shoot_now))
 
     # --- Player 4 goalkeeper ---
