@@ -71,6 +71,9 @@ GRAVITY = 9.81
 # Warmup is already done while they hold+interact; remaining to full is
 # (1-charge)*shot_charge_time_s once charge has started climbing.
 SHOT_CHARGE_TIME_S = 0.38
+# "Fully charged" for release purposes. The engine clamps charge at exactly
+# 1.0 and holds it there, so this only needs to clear float noise.
+FULL_CHARGE = 0.99
 HOLD_PROXY = 0.55
 
 
@@ -388,36 +391,88 @@ def safe_walk_target(me, ball, desired, opponents, r_eff, step=5.5):
     return me + direction * Float(step)
 
 
-def player_interact(player: int, has_ball: Node, charge: Node, release_at: float = 0.75):
-    """AIA `Player Interact` semantics (confirmed quirks doc).
+def clear_shot(shot_origin, opp_goal, opp_left_post, opp_right_post, opponents, r_eff):
+    """Is there a legal straight-line lane into the enemy goal right now, and
+    along which direction?
 
-    Ready (charge past release threshold while holding) → Interact false (kick).
-    Else → (hasBall AND charge < 1) OR (nearby AND NOT TeamHasBall).
+    Candidates are the three directions that actually score: straight at the
+    goal centre, and the two post-tangent cone edges — the true min/max angle
+    corrected for post+ball radius, since a ball aimed at the raw corner
+    clips the post instead of going in. A candidate counts only if it also
+    clears every opponent's forbidden cone, so the lane is genuinely open
+    rather than merely goal-ward.
 
-    The second clause is what makes pickup/tackle reliable: any time the ball
-    is in interact range and our team does not hold it, Interact stays true —
-    including loose balls. Stamina only decides who wins the engine duel.
+    Centre is preferred whenever it is legal (largest margin for error); the
+    tangents are the fallback for when somebody is standing in the middle.
+
+    Returns `(lane_open, aim_direction)`.
+    """
+    dir_c = unit_or_zero(opp_goal - shot_origin)
+    dir_l, _ = post_tangent(shot_origin, opp_left_post, POST_CONTACT_RADIUS)
+    dir_r, _ = post_tangent(shot_origin, opp_right_post, POST_CONTACT_RADIUS)
+    invariants = [
+        opponent_invariants(o, shot_origin, r_eff, opponent_half_angle(o, shot_origin, r_eff))
+        for o in opponents
+    ]
+    best = dir_c
+    ok = is_legal_direction(dir_c, invariants)
+    for cand in (dir_l, dir_r):
+        legal = is_legal_direction(cand, invariants)
+        take = And(legal, Not(ok))
+        best = ConditionalSetVector3(take, cand, best)
+        ok = Or(ok, legal)
+    return ok, best
+
+
+def player_interact(player: int, has_ball: Node, shoot_now: Node):
+    """Interact policy: hold maximum charge permanently, release only to shoot.
+
+    The engine charges while Interact is true, clamps at 1.0 with no decay
+    and no max-hold timer, and fires the kick the frame Interact goes false —
+    along that frame's MoveTo, not facing. Crucially, charging costs nothing:
+    stamina only drains while *sprinting*. So a carrier should sit on a fully
+    charged shot indefinitely and spend it the instant a lane opens, instead
+    of dumping the ball at a fixed charge threshold the way this used to
+    (which fired at ~0.7 charge in whatever direction MoveTo happened to
+    point, and fired again on reaching 1.0).
+
+    The `claim` clause is what keeps pickup/tackle reliable: whenever the
+    ball is in interact range and our team does not hold it, Interact stays
+    true — loose balls included. It can never fight a release, because
+    holding the ball implies Team Has Ball.
     """
     nearby = SoccerGetBool(f"Is Ball Nearby Team Player {player}")
     team_has = SoccerGetBool("Team Has Ball")
-    ready = And(has_ball, CompareFloats(charge, Float(release_at), ">="))
-    keep_charging = And(has_ball, CompareFloats(charge, Float(1.0), "<"))
+    hold_charge = And(has_ball, Not(shoot_now))
     claim = And(nearby, Not(team_has))
-    active = Or(keep_charging, claim)
-    return ConditionalSetBool(ready, Bool(False), active)
+    return Or(hold_charge, claim)
 
 
-def build_carrier_move(me, ball, goal_dir_target, opponents, r_eff, has_ball, charge):
-    """With ball: safe cone walk while charging; release snaps MoveTo to goal."""
-    desired = goal_dir_target
-    walk = safe_walk_target(me, ball, desired, opponents, r_eff)
-    charged = CompareFloats(charge, Float(0.72), ">=")
-    shoot_to = me + unit_or_zero(desired - me) * Float(10)
-    move = ConditionalSetVector3(And(has_ball, charged), shoot_to, walk)
+def build_carrier_move(me, ball, opp_goal, opp_left_post, opp_right_post, opponents, r_eff, has_ball, charge):
+    """With ball: walk a safe lane toward goal sitting on a full charge, and
+    on the tick a scoring lane opens snap MoveTo onto the aim direction.
+
+    The snap *is* the aim — the engine kicks along MoveTo — so the release
+    and the snap have to land on the same tick. That is why `shoot_now` is
+    returned rather than recomputed: it must drive Interact too.
+
+    The `charge` gate is not optional. Releasing means dropping Interact, and
+    Interact is also what *builds* the charge — so firing the moment a lane
+    happens to be open (which, on pickup in space, is immediately) holds the
+    ball at zero charge forever: the engine needs >0.05 to kick at all, so
+    nothing is ever struck. Wait for the charge to actually be banked, then
+    spend it.
+    """
+    lane_ok, aim = clear_shot(ball, opp_goal, opp_left_post, opp_right_post, opponents, r_eff)
+    ready = CompareFloats(charge, Float(FULL_CHARGE), ">=")
+    shoot_now = And(has_ball, And(lane_ok, ready))
+    walk = safe_walk_target(me, ball, opp_goal, opponents, r_eff)
+    shoot_to = me + aim * Float(10)
+    move = ConditionalSetVector3(shoot_now, shoot_to, walk)
     # Without ball: chase ball with same cone (avoid running through tacklers).
     chase = safe_walk_target(me, ball, ball, opponents, r_eff, step=8.0)
     move = ConditionalSetVector3(has_ball, move, chase)
-    return move
+    return move, shoot_now
 
 
 def gk_cover_stand(shot_origin, team_goal, left_post, right_post, interact_r, charge=None):
@@ -478,6 +533,35 @@ def gk_cover_stand(shot_origin, team_goal, left_post, right_post, interact_r, ch
     cover = ConditionalSetVector3(seals(cover), cover, cover_home)
     cover = ConditionalSetVector3(seals(cover), cover, cover_home)
     return cover, seals
+
+
+def threat_cover(opp_pos, team_goal, left_post, right_post, interact_r):
+    """Seal point for ONE opponent's shot cone at our goal.
+
+    This is the whole "multi-body goalkeeper" idea: the exact construction
+    the keeper uses against the ball carrier, handed to an outfield player
+    and pointed at a different opponent. Every opponent who could receive and
+    shoot gets somebody standing on the closest point that still covers both
+    extremes of *their* scoring cone, so the team collectively seals every
+    lane instead of one keeper guessing which one matters.
+    """
+    cover, _seals = gk_cover_stand(opp_pos, team_goal, left_post, right_post, interact_r)
+    return cover
+
+
+def clamp_own_half(p, team_goal):
+    """Keep a point on our side of the halfway line.
+
+    The keeper is allowed to press the carrier aggressively, but stepping
+    over midfield to do it means an interception behind him is an open net.
+    Team space is not sign-stable across home/away, so derive the side from
+    our own goal's x rather than assuming one.
+    """
+    defends_negative = CompareFloats(team_goal.x, Float(0), "<")
+    clamp_neg = ConditionalSetFloat(CompareFloats(p.x, Float(0), ">"), Float(0), p.x)
+    clamp_pos = ConditionalSetFloat(CompareFloats(p.x, Float(0), "<"), Float(0), p.x)
+    x = ConditionalSetFloat(defends_negative, clamp_neg, clamp_pos)
+    return Vector3(x, p.y, p.z)
 
 
 def opponent_carrier(opponents, ball):
@@ -626,8 +710,28 @@ def gk_policy(
     move = ConditionalSetVector3(And(go_to_ball, chase_ok), ball, move)
     move = ConditionalSetVector3(And(nearby, Not(has_ball)), ball, move)
 
-    # Interact = AIA Player Interact. Never gate pickup on stamina/cover.
-    interact = player_interact(4, has_ball, charge, release_at=0.70)
+    # The keeper never crosses midfield, however tempting the press or a
+    # loose ball upfield looks — being beaten past the halfway line leaves an
+    # open net behind him, and the outfield cover players exist to handle
+    # anything out there.
+    #
+    # Deliberately NOT applied while carrying: the kick fires along MoveTo, so
+    # clamping x would rotate the clear aim back toward our own goal.
+    move = ConditionalSetVector3(has_ball, move, clamp_own_half(move, team_goal))
+
+    # Same permanent-full-charge policy as everyone else: hold the ball on a
+    # maxed shot and only let go once the clear lane is actually open, rather
+    # than punting it into the nearest opponent at a fixed charge threshold.
+    clear_aim = unit_or_zero(
+        ConditionalSetVector3(IsNull(clear_dir), pos("Opponent Goal Center") - gk, clear_dir)
+    )
+    clear_invariants = [
+        opponent_invariants(o, ball, r_eff, opponent_half_angle(o, ball, r_eff))
+        for o in opponents
+    ]
+    gk_ready = CompareFloats(charge, Float(FULL_CHARGE), ">=")
+    gk_shoot = And(has_ball, And(is_legal_direction(clear_aim, clear_invariants), gk_ready))
+    interact = player_interact(4, has_ball, gk_shoot)
     return move, sprint, interact
 
 
@@ -689,41 +793,47 @@ def main() -> None:
     opp_has = SoccerGetBool("Opponent Has Ball")
     loose = SoccerGetBool("Is Ball Loose")
 
-    # --- Player 1 attacker ---
-    h1 = SoccerGetBool("Team Player 1 Has Ball")
-    c1 = SoccerGetFloat("Teammate 1 Shot Charge")
-    move1 = build_carrier_move(p1, ball, opp_goal, opponents, r_eff, h1, c1)
-    # Support when teammate has ball: safe lane ahead of carrier.
-    support1 = safe_walk_target(p1, ball, ball + unit_or_zero(opp_goal - ball) * Float(10), opponents, r_eff)
-    move1 = ConditionalSetVector3(And(team_has, Not(h1)), support1, move1)
-    # Loose: if closest, go to ball.
-    closest1 = SoccerGetBool("Is Team Player 1 Closest Teammate to Ball")
-    move1 = ConditionalSetVector3(And(loose, closest1), ball, move1)
-    sprint1 = Bool(True)
-    interact1 = player_interact(1, h1, c1, release_at=0.72)
-    SoccerController(1, move1, sprint1, interact1)
+    # --- Outfield players 1-3: multi-body goalkeeper ---
+    #
+    # The team defends as one keeper with four bodies. When the opponent has
+    # the ball, each outfielder seals a DISTINCT opponent's scoring cone
+    # (`threat_cover`, the same construction P4 uses on the carrier), so every
+    # player who could receive a pass and shoot already has their lane shut
+    # rather than the keeper guessing which pass is coming. Assignment is by
+    # index so the three cover three different opponents — the fourth is the
+    # carrier, whom the keeper is pressing directly.
+    #
+    # With the ball, the same players push forward and take the shot the tick
+    # a lane opens (`build_carrier_move`), sitting on a permanently full
+    # charge until then.
+    for slot, me, marks in ((1, p1, opponents[0]), (2, p2, opponents[1]), (3, p3, opponents[2])):
+        has = SoccerGetBool(f"Team Player {slot} Has Ball")
+        charge = SoccerGetFloat(f"Teammate {slot} Shot Charge")
+        closest = SoccerGetBool(f"Is Team Player {slot} Closest Teammate to Ball")
 
-    # --- Player 2 lackey left ---
-    h2 = SoccerGetBool("Team Player 2 Has Ball")
-    c2 = SoccerGetFloat("Teammate 2 Shot Charge")
-    spot2 = ball + Vector3(unit_or_zero(opp_goal - ball).x * Float(8), Float(0), Float(7))
-    move2 = ConditionalSetVector3(h2, build_carrier_move(p2, ball, opp_goal, opponents, r_eff, h2, c2), spot2)
-    closest2 = SoccerGetBool("Is Team Player 2 Closest Teammate to Ball")
-    move2 = ConditionalSetVector3(And(loose, closest2), ball, move2)
-    sprint2 = Or(h2, And(loose, closest2))
-    interact2 = player_interact(2, h2, c2, release_at=0.90)
-    SoccerController(2, move2, sprint2, interact2)
+        carry, shoot_now = build_carrier_move(
+            me, ball, opp_goal, opp_left_post, opp_right_post, opponents, r_eff, has, charge
+        )
+        # Defensive default: seal our assigned opponent's shot cone.
+        move = threat_cover(marks, team_goal, left_post, right_post, r_int)
+        # Attacking: carry/shoot, or run a safe lane ahead of the carrier.
+        support = safe_walk_target(
+            me, ball, ball + unit_or_zero(opp_goal - ball) * Float(10), opponents, r_eff
+        )
+        move = ConditionalSetVector3(And(team_has, Not(has)), support, move)
+        move = ConditionalSetVector3(has, carry, move)
+        # Loose ball is nobody's yet — whoever is closest goes and wins it.
+        move = ConditionalSetVector3(And(loose, closest), ball, move)
 
-    # --- Player 3 lackey right ---
-    h3 = SoccerGetBool("Team Player 3 Has Ball")
-    c3 = SoccerGetFloat("Teammate 3 Shot Charge")
-    spot3 = ball + Vector3(unit_or_zero(opp_goal - ball).x * Float(8), Float(0), Float(0) - Float(7))
-    move3 = ConditionalSetVector3(h3, build_carrier_move(p3, ball, opp_goal, opponents, r_eff, h3, c3), spot3)
-    closest3 = SoccerGetBool("Is Team Player 3 Closest Teammate to Ball")
-    move3 = ConditionalSetVector3(And(loose, closest3), ball, move3)
-    sprint3 = Or(h3, And(loose, closest3))
-    interact3 = player_interact(3, h3, c3, release_at=0.90)
-    SoccerController(3, move3, sprint3, interact3)
+        # Stamina IS ball retention: a tackle is decided by
+        # `tackler_stamina >= carrier_stamina`, and sprinting is the only
+        # thing that spends stamina. So a full-stamina carrier simply cannot
+        # be dispossessed, and a defender who has been sprinting loses every
+        # duel he starts. Sprint only to win a loose ball we are already
+        # closest to — never while carrying (that would trade the ball for a
+        # little speed), and never merely because the opponent has it.
+        sprint = And(loose, closest)
+        SoccerController(slot, move, sprint, player_interact(slot, has, shoot_now))
 
     # --- Player 4 goalkeeper ---
     h4 = SoccerGetBool("Team Player 4 Has Ball")
