@@ -81,6 +81,17 @@ def pos(label: str):
     return RelativePosition(SoccerGetTransform(label), "Self")
 
 
+def plot_xz(prefix: str, color: str, vec) -> None:
+    """Log a position/direction to TimePlot (F1) as two channels, X and Z —
+    Y is always ~0 on this pitch so it's not worth the extra channel. Kept
+    deliberately minimal (no Y, no derived values) so this doesn't add
+    enough TimePlot load to visibly lag the real game.
+    """
+    comps = Vector3Split(vec)
+    TimePlot(String(f"{prefix}.X"), color, String(""), comps.x)
+    TimePlot(String(f"{prefix}.Z"), color, String(""), comps.z)
+
+
 @cache
 def rotate_xz(v, angle):
     """Rotate pitch vector around Y by `angle` radians (X/Z plane)."""
@@ -884,6 +895,8 @@ def main() -> None:
         pos("Opponent Player 3"),
         pos("Opponent Player 4"),
     ]
+    for i, opp in enumerate(opponents, start=1):
+        plot_xz(f"Titanium.Opp{i}.Pos", "Red", opp)
 
     r_int = SoccerGetFloat("Player Interact Radius")
     r_eff = r_int + Float(BALL_RADIUS)
@@ -963,6 +976,8 @@ def main() -> None:
         loose_target = ConditionalSetVector3(contested, meet_point_sprint, meet_point_walk)
         move = ConditionalSetVector3(And(loose, closest), loose_target, move)
         sprint = And(loose, And(closest, contested))
+        plot_xz(f"Titanium.P{slot}.Pos", "Cyan", me)
+        plot_xz(f"Titanium.P{slot}.Target", "Yellow", move)
         SoccerController(slot, move, sprint, player_interact(slot, has, shoot_now))
 
     # --- Player 4 goalkeeper ---
@@ -988,6 +1003,8 @@ def main() -> None:
     # inside gk_policy (goal-bound-shot walk-vs-sprint check).
     closest4 = SoccerGetBool("Is Team Player 4 Closest Teammate to Ball")
     move4 = ConditionalSetVector3(And(loose, closest4), ball, move4)
+    plot_xz("Titanium.P4.Pos", "Cyan", p4)
+    plot_xz("Titanium.P4.Target", "Yellow", move4)
     SoccerController(4, move4, sprint4, interact4)
 
     SAVES.parent.mkdir(parents=True, exist_ok=True)
