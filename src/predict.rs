@@ -256,6 +256,129 @@ fn reachable_post_aims(
     (Vec2::new(own_goal_x, half), Vec2::new(own_goal_x, -half))
 }
 
+fn rotate(v: Vec2, angle: f32) -> Vec2 {
+    let (s, c) = angle.sin_cos();
+    Vec2::new(v.x * c - v.y * s, v.x * s + v.y * c)
+}
+
+fn cross2(a: Vec2, b: Vec2) -> f32 {
+    a.x * b.y - a.y * b.x
+}
+
+/// Signed post-x for the goal at `own_goal_x` (`posts_x` is stored as a
+/// magnitude in params; mirror it onto whichever side the goal is on).
+fn signed_posts_x(own_goal_x: f32, params: &EngineParams) -> f32 {
+    own_goal_x.signum() * params.posts_x.abs()
+}
+
+/// Direction from `shot_origin` to the point where a straight shot just
+/// clears a post's physical body (post + ball radius), on the side facing
+/// the goal's center line (z = 0).
+///
+/// This is the *true* boundary of a legal straight-line shot around that
+/// post: a ball aimed at the raw post position (or the goal-mouth corner)
+/// would clip the post, not score. `post_center` must be the actual post
+/// collision-circle center (`posts_x`, not `goal_line_x`); `contact_r` is
+/// `post_radius + ball_radius`.
+///
+/// Returns `None` if `shot_origin` is at or inside the clearance circle —
+/// there is no legal tangent line from there.
+pub fn post_tangent_dir(shot_origin: Vec2, post_center: Vec2, contact_r: f32) -> Option<Vec2> {
+    let to_post = post_center - shot_origin;
+    let d = to_post.length();
+    if d <= contact_r + 1e-5 {
+        return None;
+    }
+    let u = to_post / d;
+    let alpha = (contact_r / d).clamp(-1.0, 1.0).asin();
+    let cand_a = rotate(u, alpha);
+    let cand_b = rotate(u, -alpha);
+    let l = (d * d - contact_r * contact_r).max(0.0).sqrt();
+    let point_a = shot_origin + cand_a * l;
+    let point_b = shot_origin + cand_b * l;
+    // Inward tangent: whichever lands closer to the goal's center line.
+    Some(if point_a.y.abs() <= point_b.y.abs() {
+        cand_a
+    } else {
+        cand_b
+    })
+}
+
+/// True left/right boundary **directions** of the straight-line scoring cone
+/// from `shot_origin`, accounting for post + ball collision radius. `left`
+/// is the +z (left) post side, `right` is -z. Anything angularly between
+/// `left` and `right` (see [`shot_dir_in_cone`]) is a legal straight shot;
+/// anything outside clips a post or misses wide.
+///
+/// `None` if `shot_origin` sits at/inside either post's clearance circle
+/// (degenerate — e.g. standing on top of a post).
+pub fn shot_cone_bounds(
+    shot_origin: Vec2,
+    own_goal_x: f32,
+    goal_half_width: f32,
+    params: &EngineParams,
+) -> Option<(Vec2, Vec2)> {
+    let post_x = signed_posts_x(own_goal_x, params);
+    let contact_r = params.post_radius + params.ball_radius;
+    let left_post = Vec2::new(post_x, goal_half_width);
+    let right_post = Vec2::new(post_x, -goal_half_width);
+    let left = post_tangent_dir(shot_origin, left_post, contact_r)?;
+    let right = post_tangent_dir(shot_origin, right_post, contact_r)?;
+    Some((left, right))
+}
+
+/// Same boundary as [`shot_cone_bounds`] but returned as the actual tangent
+/// **points** (world-space aim spots) instead of directions — handy for
+/// debug drawing or as literal flick-shot aim targets.
+pub fn shot_cone_aim_points(
+    shot_origin: Vec2,
+    own_goal_x: f32,
+    goal_half_width: f32,
+    params: &EngineParams,
+) -> Option<(Vec2, Vec2)> {
+    let post_x = signed_posts_x(own_goal_x, params);
+    let contact_r = params.post_radius + params.ball_radius;
+    let left_post = Vec2::new(post_x, goal_half_width);
+    let right_post = Vec2::new(post_x, -goal_half_width);
+    let (left_dir, right_dir) = shot_cone_bounds(shot_origin, own_goal_x, goal_half_width, params)?;
+    let tangent_len = |post: Vec2| {
+        ((post - shot_origin).length_squared() - contact_r * contact_r)
+            .max(0.0)
+            .sqrt()
+    };
+    Some((
+        shot_origin + left_dir * tangent_len(left_post),
+        shot_origin + right_dir * tangent_len(right_post),
+    ))
+}
+
+/// Whether `dir` (from `shot_origin`) lies within the true scoring cone —
+/// i.e. a shot along it clears both posts and enters the goal. Boundary
+/// directions from [`shot_cone_bounds`] count as inside.
+pub fn shot_dir_in_cone(
+    shot_origin: Vec2,
+    dir: Vec2,
+    own_goal_x: f32,
+    goal_half_width: f32,
+    params: &EngineParams,
+) -> bool {
+    let Some((left, right)) = shot_cone_bounds(shot_origin, own_goal_x, goal_half_width, params)
+    else {
+        return false;
+    };
+    if dir.length_squared() < 1e-10 {
+        return false;
+    }
+    let dir = dir.normalize();
+    let span = cross2(right, left);
+    if span.abs() < 1e-8 {
+        return false;
+    }
+    let c1 = cross2(right, dir);
+    let c2 = cross2(dir, left);
+    c1 * span >= -1e-6 && c2 * span >= -1e-6
+}
+
 /// Half-angle α = θ/2 of the shot cone ∠LAR at the attacker.
 fn shot_cone_half_angle(attacker: Vec2, left: Vec2, right: Vec2) -> Option<f32> {
     let to_l = left - attacker;
@@ -1030,6 +1153,152 @@ mod tests {
             4.0,
         );
         assert!(g.x >= 0.0, "x={}", g.x);
+    }
+
+    #[test]
+    fn post_tangent_dir_none_when_inside_clearance_circle() {
+        let post = Vec2::new(39.5, 6.0);
+        // Origin sitting right on top of the post's contact circle.
+        assert!(post_tangent_dir(post, post, 0.7).is_none());
+        let just_inside = post + Vec2::new(0.0, 0.3);
+        assert!(post_tangent_dir(just_inside, post, 0.7).is_none());
+    }
+
+    /// The tangent direction must actually be tangent: the resulting point
+    /// sits exactly `contact_r` from the post center, and the line from
+    /// `shot_origin` to that point is perpendicular to the post's radius
+    /// there. This is the ground-truth geometric property the whole shot
+    /// cone rests on.
+    fn assert_true_tangent(shot_origin: Vec2, post_center: Vec2, contact_r: f32, dir: Vec2) {
+        let d = (post_center - shot_origin).length();
+        let l = (d * d - contact_r * contact_r).max(0.0).sqrt();
+        let point = shot_origin + dir * l;
+        let dist_to_post = point.distance(post_center);
+        assert!(
+            (dist_to_post - contact_r).abs() < 1e-3,
+            "tangent point should sit exactly contact_r from post: got {dist_to_post}, want {contact_r}"
+        );
+        let radius_dir = (point - post_center) / contact_r;
+        let perpendicularity = dir.dot(radius_dir).abs();
+        assert!(
+            perpendicularity < 1e-3,
+            "line to tangent point should be perpendicular to post radius, got dot={perpendicularity}"
+        );
+    }
+
+    #[test]
+    fn post_tangent_dir_is_a_true_tangent_central_shooter() {
+        let params = EngineParams::default();
+        let contact_r = params.post_radius + params.ball_radius;
+        let origin = Vec2::new(0.0, 0.0);
+        let left_post = Vec2::new(39.5, 6.0);
+        let right_post = Vec2::new(39.5, -6.0);
+        let left = post_tangent_dir(origin, left_post, contact_r).unwrap();
+        let right = post_tangent_dir(origin, right_post, contact_r).unwrap();
+        assert_true_tangent(origin, left_post, contact_r, left);
+        assert_true_tangent(origin, right_post, contact_r, right);
+        // Central shooter: bounds must be mirror images in z.
+        assert!((left.y + right.y).abs() < 1e-4, "left={left:?} right={right:?}");
+        // The inward tangent must clear *inside* the raw post z, toward center.
+        assert!(left.y > 0.0 && right.y < 0.0);
+    }
+
+    #[test]
+    fn post_tangent_dir_is_a_true_tangent_off_center_shooter() {
+        let params = EngineParams::default();
+        let contact_r = params.post_radius + params.ball_radius;
+        let origin = Vec2::new(-10.0, 3.5);
+        let left_post = Vec2::new(39.5, 6.0);
+        let right_post = Vec2::new(39.5, -6.0);
+        let left = post_tangent_dir(origin, left_post, contact_r).unwrap();
+        let right = post_tangent_dir(origin, right_post, contact_r).unwrap();
+        assert_true_tangent(origin, left_post, contact_r, left);
+        assert_true_tangent(origin, right_post, contact_r, right);
+    }
+
+    #[test]
+    fn shot_cone_narrower_than_naive_corner_aim() {
+        let params = EngineParams::default();
+        let origin = Vec2::new(0.0, 0.0);
+        let own_goal_x = params.goal_line_x;
+        let (left, right) =
+            shot_cone_bounds(origin, own_goal_x, params.goal_half_width, &params).unwrap();
+        let naive_left = (Vec2::new(own_goal_x, params.goal_half_width) - origin).normalize();
+        let naive_right = (Vec2::new(own_goal_x, -params.goal_half_width) - origin).normalize();
+        // Post clearance must pull both bounds inward (smaller |angle| from
+        // center) relative to the raw geometric corner.
+        assert!(
+            left.y < naive_left.y,
+            "left={left:?} naive_left={naive_left:?}"
+        );
+        assert!(
+            right.y > naive_right.y,
+            "right={right:?} naive_right={naive_right:?}"
+        );
+    }
+
+    #[test]
+    fn shot_dir_in_cone_accepts_center_rejects_wide() {
+        let params = EngineParams::default();
+        let origin = Vec2::new(0.0, 0.0);
+        let own_goal_x = params.goal_line_x;
+        let half = params.goal_half_width;
+        // Straight down the middle: always legal.
+        assert!(shot_dir_in_cone(
+            origin,
+            Vec2::new(own_goal_x, 0.0) - origin,
+            own_goal_x,
+            half,
+            &params
+        ));
+        // Aimed well wide of the post: illegal.
+        assert!(!shot_dir_in_cone(
+            origin,
+            Vec2::new(own_goal_x, half * 3.0) - origin,
+            own_goal_x,
+            half,
+            &params
+        ));
+        assert!(!shot_dir_in_cone(
+            origin,
+            Vec2::new(own_goal_x, -half * 3.0) - origin,
+            own_goal_x,
+            half,
+            &params
+        ));
+        // The tangent-corrected bound itself must read as inside (boundary
+        // inclusive), while the raw uncorrected corner (which clips the
+        // post) must read as outside.
+        let (left, right) = shot_cone_bounds(origin, own_goal_x, half, &params).unwrap();
+        assert!(shot_dir_in_cone(origin, left, own_goal_x, half, &params));
+        assert!(shot_dir_in_cone(origin, right, own_goal_x, half, &params));
+        assert!(!shot_dir_in_cone(
+            origin,
+            Vec2::new(own_goal_x, half) - origin,
+            own_goal_x,
+            half,
+            &params
+        ));
+        assert!(!shot_dir_in_cone(
+            origin,
+            Vec2::new(own_goal_x, -half) - origin,
+            own_goal_x,
+            half,
+            &params
+        ));
+    }
+
+    #[test]
+    fn shot_cone_aim_points_land_on_the_tangent_circle() {
+        let params = EngineParams::default();
+        let contact_r = params.post_radius + params.ball_radius;
+        let origin = Vec2::new(-5.0, -2.0);
+        let own_goal_x = params.goal_line_x;
+        let half = params.goal_half_width;
+        let (left_pt, right_pt) = shot_cone_aim_points(origin, own_goal_x, half, &params).unwrap();
+        let post_x = signed_posts_x(own_goal_x, &params);
+        assert!((left_pt.distance(Vec2::new(post_x, half)) - contact_r).abs() < 1e-3);
+        assert!((right_pt.distance(Vec2::new(post_x, -half)) - contact_r).abs() < 1e-3);
     }
 
     #[test]
