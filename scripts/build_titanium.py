@@ -848,7 +848,25 @@ def main() -> None:
     # With the ball, the same players push forward and take the shot the tick
     # a lane opens (`build_carrier_move`), sitting on a permanently full
     # charge until then.
-    for slot, me, marks in ((1, p1, opponents[0]), (2, p2, opponents[1]), (3, p3, opponents[2])):
+    # Attacking shape, ball-relative. `fwd` is the attack axis and `lat` is
+    # its left-hand perpendicular in the pitch plane, so the stations rotate
+    # with the direction of play instead of being pinned to world axes.
+    #
+    # Every outfielder previously computed the SAME support target and they
+    # duly walked into one pile — four bodies inside a few metres, nobody
+    # anywhere else to pass to, attack stalled with the ball stuck in a
+    # corner. Distinct stations are what stop that: two wide either side and
+    # ahead of the ball to stretch the defence, one trailing goal-side as the
+    # safe backward outlet (which is also the receiver the carrier will look
+    # for when it cannot escape a tackle).
+    fwd = unit_or_zero(opp_goal - ball)
+    lat = Vector3(Float(0) - fwd.z, Float(0), fwd.x)
+
+    for slot, me, marks, ahead, side in (
+        (1, p1, opponents[0], 9.0, 7.0),
+        (2, p2, opponents[1], 9.0, -7.0),
+        (3, p3, opponents[2], -6.0, 0.0),
+    ):
         has = SoccerGetBool(f"Team Player {slot} Has Ball")
         charge = SoccerGetFloat(f"Teammate {slot} Shot Charge")
         closest = SoccerGetBool(f"Is Team Player {slot} Closest Teammate to Ball")
@@ -858,10 +876,8 @@ def main() -> None:
         )
         # Defensive default: seal our assigned opponent's shot cone.
         move = threat_cover(marks, team_goal, left_post, right_post, r_int)
-        # Attacking: carry/shoot, or run a safe lane ahead of the carrier.
-        support = safe_walk_target(
-            me, ball, ball + unit_or_zero(opp_goal - ball) * Float(10), opponents, r_eff
-        )
+        # Attacking: hold this player's own station in the shape.
+        support = ball + fwd * Float(ahead) + lat * Float(side)
         move = ConditionalSetVector3(And(team_has, Not(has)), support, move)
         move = ConditionalSetVector3(has, carry, move)
 
