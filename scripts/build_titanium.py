@@ -739,12 +739,7 @@ def gk_policy(
     AIA Player Interact so any nearby claimable ball is always grabbed.
     """
     interact_r = SoccerGetFloat("Player Interact Radius")
-    # TEMP DEBUG: ground-truth what this branch actually resolves to at
-    # runtime, since GK behavior when playing Away does not match what the
-    # code reads as. Yellow = team_goal, White = ball-based cover.
-    DebugDrawDisc(team_goal, Float(0.4), Float(0.1), "Yellow")
     cover, seals = gk_cover_stand(ball, team_goal, left_post, right_post, interact_r)
-    DebugDrawDisc(cover, Float(0.4), Float(0.1), "White")
 
     # With ball: clear upfield; do not sprint for the clear walk-up.
     #
@@ -796,9 +791,6 @@ def gk_policy(
     press, _carrier_seals = gk_cover_stand(
         carrier_pred, team_goal, left_post, right_post, interact_r, charge=carrier_charge
     )
-    # TEMP DEBUG. Green = carrier (opponent body), Magenta = press target.
-    DebugDrawDisc(carrier, Float(0.4), Float(0.1), "Green")
-    DebugDrawDisc(press, Float(0.4), Float(0.1), "Magenta")
     move = ConditionalSetVector3(opp_has, press, move)
 
     # When the ball is claimable (nearby / loose toward us), step onto it so
@@ -817,10 +809,7 @@ def gk_policy(
     #
     # Deliberately NOT applied while carrying: the kick fires along MoveTo, so
     # clamping x would rotate the clear aim back toward our own goal.
-    # TEMP DEBUG. Orange = move before the own-half clamp, Red = after.
-    DebugDrawDisc(move, Float(0.4), Float(0.1), "Orange")
     move = ConditionalSetVector3(has_ball, move, clamp_own_half(move, team_goal))
-    DebugDrawDisc(move, Float(0.4), Float(0.1), "Red")
 
     # Same permanent-full-charge policy as everyone else: hold the ball on a
     # maxed shot and only let go once the clear lane is actually open, rather
