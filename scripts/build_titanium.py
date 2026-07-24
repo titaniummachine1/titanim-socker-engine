@@ -424,6 +424,53 @@ def clear_shot(shot_origin, opp_goal, opp_left_post, opp_right_post, opponents, 
     return ok, best
 
 
+def tackle_duty(slot: int):
+    """Should THIS player be the one to press Interact on an opponent carrier?
+
+    A tackle drains `min(tackler_stam, carrier_stam)` from BOTH players and is
+    won by the tackler iff `tackler_stam >= carrier_stam`. Two consequences,
+    neither of which we were using while everyone simply spammed Interact:
+
+      * Sending everybody in wastes our strongest players. Among those who
+        would actually WIN the duel, the *cheapest* winner should go; the
+        others keep their stamina, and with it their own immunity to being
+        tackled (a full-stamina player cannot be dispossessed at all).
+      * When nobody can win outright, a doomed tackle is still worth making:
+        it costs the carrier exactly as much as it costs us. Feed the weakest
+        player in first and the carrier is ground down until somebody who was
+        previously below the bar now clears it.
+
+    So: if anyone in range can win, the lowest-stamina winner tackles;
+    otherwise the lowest-stamina player in range tackles as a sacrifice.
+
+    Ties break by slot through a tiny index epsilon on the sort key, so
+    exactly one player is ever designated — without it, two equal-stamina
+    players would both see themselves as "the cheapest" and both pile in,
+    which is the waste this is meant to prevent.
+    """
+    carrier_stam = SoccerGetFloat("Ball Carrier Stamina")
+    near = [SoccerGetBool(f"Is Ball Nearby Team Player {i}") for i in range(1, 5)]
+    stam = [SoccerGetFloat(f"Team Player {i} Stamina") for i in range(1, 5)]
+    key = [stam[i] + Float((i + 1) * 0.0001) for i in range(4)]
+    win = [And(near[i], CompareFloats(stam[i], carrier_stam, ">=")) for i in range(4)]
+
+    any_win = Bool(False)
+    for w in win:
+        any_win = Or(any_win, w)
+    # Prefer winners when one exists; otherwise everyone in range is a
+    # candidate sacrifice.
+    eligible = [ConditionalSetBool(any_win, win[i], near[i]) for i in range(4)]
+
+    me = slot - 1
+    duty = eligible[me]
+    for k in range(4):
+        if k == me:
+            continue
+        cheaper = And(eligible[k], CompareFloats(key[k], key[me], "<"))
+        duty = And(duty, Not(cheaper))
+    return duty
+
+
 def player_interact(player: int, has_ball: Node, shoot_now: Node):
     """Interact policy: hold maximum charge permanently, release only to shoot.
 
@@ -436,16 +483,19 @@ def player_interact(player: int, has_ball: Node, shoot_now: Node):
     (which fired at ~0.7 charge in whatever direction MoveTo happened to
     point, and fired again on reaching 1.0).
 
-    The `claim` clause is what keeps pickup/tackle reliable: whenever the
-    ball is in interact range and our team does not hold it, Interact stays
-    true — loose balls included. It can never fight a release, because
-    holding the ball implies Team Has Ball.
+    Claiming splits by ball state. A LOOSE ball is free — no duel, no cost,
+    so anyone in range grabs it. A ball HELD by an opponent costs a stamina
+    duel, so only the designated tackler presses (see `tackle_duty`); the
+    rest keep their stamina instead of throwing it away on duels they were
+    always going to lose.
     """
     nearby = SoccerGetBool(f"Is Ball Nearby Team Player {player}")
-    team_has = SoccerGetBool("Team Has Ball")
+    loose = SoccerGetBool("Is Ball Loose")
+    opp_has = SoccerGetBool("Opponent Has Ball")
     hold_charge = And(has_ball, Not(shoot_now))
-    claim = And(nearby, Not(team_has))
-    return Or(hold_charge, claim)
+    grab = And(nearby, loose)
+    tackle = And(And(nearby, opp_has), tackle_duty(player))
+    return Or(hold_charge, Or(grab, tackle))
 
 
 def build_carrier_move(me, ball, opp_goal, opp_left_post, opp_right_post, opponents, r_eff, has_ball, charge):
