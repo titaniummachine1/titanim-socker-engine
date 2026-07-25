@@ -524,7 +524,12 @@ def build_carrier_move(me, ball, opp_goal, opp_left_post, opp_right_post, oppone
     nothing is ever struck. Wait for the charge to actually be banked, then
     spend it.
     """
-    lane_ok, aim = clear_shot(ball, opp_goal, opp_left_post, opp_right_post, opponents, r_eff)
+    # Shot origin is the CARRIER, not the ball's transform: the real engine
+    # visually orbits the held ball at an offset in front of the player, but
+    # the actual kick fires from the player's own center. Aiming the tangent
+    # geometry from `ball` (the offset position) instead of `me` was solving
+    # a slightly wrong triangle every time.
+    lane_ok, aim = clear_shot(me, opp_goal, opp_left_post, opp_right_post, opponents, r_eff)
     ready = CompareFloats(charge, Float(FULL_CHARGE), ">=")
     shoot_now = And(has_ball, And(lane_ok, ready))
     walk = safe_walk_target(me, ball, opp_goal, opponents, r_eff)
@@ -836,8 +841,10 @@ def gk_policy(
     clear_aim = unit_or_zero(
         ConditionalSetVector3(IsNull(clear_dir), pos("Opponent Goal Center") - gk, clear_dir)
     )
+    # Same shot-origin correction as build_carrier_move: the kick fires from
+    # the GK's own center, not the ball's visually-offset held position.
     clear_invariants = [
-        opponent_invariants(o, ball, r_eff, opponent_half_angle(o, ball, r_eff))
+        opponent_invariants(o, gk, r_eff, opponent_half_angle(o, gk, r_eff))
         for o in opponents
     ]
     gk_ready = CompareFloats(charge, Float(FULL_CHARGE), ">=")
@@ -897,6 +904,12 @@ def main() -> None:
     ]
     for i, opp in enumerate(opponents, start=1):
         plot_xz(f"Titanium.Opp{i}.Pos", "Red", opp)
+    # Diagnostic: does SoccerGetVector3("Ball Velocity") actually read a live
+    # value in the real game, or does it collapse to ~0? predict_ball_meet_point
+    # degenerates to "just chase the ball's current position" whenever
+    # velocity reads near-zero, which would look exactly like "never
+    # intercepts, just walks to the ball" regardless of the solve itself.
+    plot_xz("Titanium.BallVel", "Magenta", SoccerGetVector3("Ball Velocity"))
 
     r_int = SoccerGetFloat("Player Interact Radius")
     r_eff = r_int + Float(BALL_RADIUS)
