@@ -41,6 +41,24 @@ SAVES = (
 # headless harnesses can load it. That path is gitignored there — the graph
 # is a build artifact, the source stays here.
 LOCAL_OUT = ROOT.parents[0] / "aicomp-soccer-sim" / "data" / "titanium" / "Titanium.txt"
+# Every build lands here first. SAVES/LOCAL_OUT (the "live" submission copy
+# and the sim's gated-champion copy) are only touched by --promote, after a
+# candidate has actually won its gate — a build must never silently
+# overwrite whatever's currently accepted as strongest.
+CANDIDATE_OUT = ROOT / "out" / "Titanium_candidate.txt"
+# Side-by-side playtest save (does NOT overwrite live Titanium.txt).
+TEST_SAVES = (
+    Path.home()
+    / "AppData"
+    / "LocalLow"
+    / "Unicorn One"
+    / "AIComp"
+    / "Saves"
+    / "Soccer"
+    / "Titanium_test.txt"
+)
+TEST_LOCAL = ROOT.parents[0] / "aicomp-soccer-sim" / "data" / "titanium" / "Titanium_test.txt"
+BACKUPS_DIR = ROOT.parents[0] / "aicomp-soccer-sim" / "data" / "titanium" / "backups"
 
 BALL_RADIUS = 0.4064
 # Upright post world radius. Not exposed by any SoccerGet — hardcoded from
@@ -74,7 +92,18 @@ SHOT_CHARGE_TIME_S = 0.38
 # "Fully charged" for release purposes. The engine clamps charge at exactly
 # 1.0 and holds it there, so this only needs to clear float noise.
 FULL_CHARGE = 0.99
+# Horizontal launch speed at charge=1.0 — used only to time "can an opponent
+# sprint-intercept this full-power shot before it reaches the goal".
+FULL_SHOT_SPEED = KICK_SPEED_BASE + KICK_SPEED_PER_CHARGE
+# Held-ball visual/physical offset ahead of facing (AIA_UPSTREAM_QUIRKS #hold_offset_m).
+HOLD_OFFSET_M = 1.67
 HOLD_PROXY = 0.55
+# Opponents inside this multiple of interact_r trigger anti-tackle / lackey logic.
+ANTI_TACKLE_NEAR_MULT = 1.5
+# Binary-search window around the desired facing (±radians).
+ANTI_TACKLE_SEARCH_RAD = math.radians(120)
+# Lackey stands this far behind the carrier — close enough for a guaranteed outlet.
+LACKEY_STANDOFF_M = 3.5
 
 
 def pos(label: str):
@@ -193,67 +222,91 @@ def post_tangent(origin, post_center, contact_r):
     return direction, point
 
 
-_EVENT_LEG_BUILT = False
+_EVENT_LEG_CHAIN_BUILT = False
 
 
-def _build_event_leg_function():
-    """`_event_leg` (ball_trajectory_graph's per-segment friction+wall-bounce
-    solve) built ONCE as a real reusable graph function instead of being
-    inlined at every call site — the whole point being fewer total nodes.
+def _build_event_leg_chain_function():
+    """`TitaniumEventLegChain` — up to three chained friction+wall-bounce
+    legs (two possible bounces), aggregated down to "does any leg cross
+    the goal line at `goal_x`, and if so when/where". Mirrors
+    `ball_trajectory_graph._build_trajectory_solve`'s inline 3-leg chain
+    (`first`/`second`/`third = _event_leg(...)` built inside ONE function
+    body) rather than calling the `_call_event_leg` wrapper repeatedly:
+    chaining raw `_event_leg` calls inside a single function body is safe
+    (pure graph-node composition, no SetVariable/GetVariable round trip),
+    but chaining `CustomFunction("TitaniumEventLeg", ...)` calls is NOT —
+    its side-channel outputs share one variable slot that the second call
+    clobbers before the first is read (this caused a 0-10 loss previously).
 
-    It needs six outputs; graph functions here only return one value, so
-    the rest publish through SetVariable/GetVariable, the same side-channel
-    ball_trajectory_graph itself already uses for its per-segment outputs.
-    The one value actually returned (`goal_point`) is always consumed by
-    every caller, so the call can never be pruned as dead/unused code by
-    the demand-driven interpreter — that would silently drop the
-    SetVariable side effects the other five outputs depend on.
+    A wall-bounce that redirects the ball toward a goal is a real threat
+    even though the bounce itself doesn't score — chasing only the first
+    leg (as this used to) misses exactly that case.
     """
-    global _EVENT_LEG_BUILT
-    if _EVENT_LEG_BUILT:
+    global _EVENT_LEG_CHAIN_BUILT
+    if _EVENT_LEG_CHAIN_BUILT:
         return
     traj.build_trajectory_physics_functions()
-    fn = traj._begin_function("TitaniumEventLeg")
-    # Function params are typed "Any" in this library, so `.x`/`.z` (which
-    # gate on self.type == "Vector3") raise on them directly — go through
-    # Vector3Split (a plain node wiring, no such type gate) and reconstruct
-    # proper Vector3 nodes before handing them to `_event_leg`, which does
-    # use `.x`/`.z` internally.
+    fn = traj._begin_function("TitaniumEventLegChain")
     start_parts = Vector3Split(fn.Param1)
     velocity_parts = Vector3Split(fn.Param2)
     start = Vector3(start_parts.x, start_parts.y, start_parts.z)
     velocity = Vector3(velocity_parts.x, Float(0), velocity_parts.z)
     live_y = fn.Param3
-    leg = traj._event_leg(start, velocity, live_y)
-    SetVariable("_TitaniumEventLegHasGoal", leg["has_goal"])
-    SetVariable("_TitaniumEventLegHasWall", leg["has_wall"])
-    SetVariable("_TitaniumEventLegEventTime", leg["event_time"])
-    SetVariable("_TitaniumEventLegContact", leg["contact"])
-    SetVariable("_TitaniumEventLegBounceVelocity", leg["bounce_velocity"])
+    goal_x = fn.Param4
+
+    leg1 = traj._event_leg(start, velocity, live_y)
+    leg2 = traj._event_leg(leg1["contact"], leg1["bounce_velocity"], live_y)
+    leg3 = traj._event_leg(leg2["contact"], leg2["bounce_velocity"], live_y)
+
+    def _at_goal(leg):
+        x = Vector3Split(leg["goal_point"]).x
+        return And(leg["has_goal"], CompareFloats(Abs(x - goal_x), Float(0.5), "<="))
+
+    leg1_at_goal = _at_goal(leg1)
+    leg2_at_goal = And(leg1["has_wall"], _at_goal(leg2))
+    leg3_at_goal = And(leg1["has_wall"], And(leg2["has_wall"], _at_goal(leg3)))
+
+    is_threat = Or(leg1_at_goal, Or(leg2_at_goal, leg3_at_goal))
+    time2 = leg1["event_time"] + leg2["event_time"]
+    time3 = time2 + leg3["event_time"]
+    time = ConditionalSetFloat(
+        leg1_at_goal,
+        leg1["event_time"],
+        ConditionalSetFloat(leg2_at_goal, time2, ConditionalSetFloat(leg3_at_goal, time3, Float(0))),
+    )
+    point = ConditionalSetVector3(
+        leg1_at_goal,
+        leg1["goal_point"],
+        ConditionalSetVector3(leg2_at_goal, leg2["goal_point"], ConditionalSetVector3(leg3_at_goal, leg3["goal_point"], start)),
+    )
+
+    SetVariable("_TitaniumEventLegChainIsThreat", is_threat)
+    SetVariable("_TitaniumEventLegChainTime", time)
     traj._finish(
         fn,
-        leg["goal_point"],
-        (fn.Param1, fn.Param2, fn.Param3, start, velocity, leg["goal_point"]),
+        point,
+        (
+            fn.Param1, fn.Param2, fn.Param3, fn.Param4,
+            start, velocity, leg1_at_goal, leg2_at_goal, leg3_at_goal,
+            is_threat, time, point,
+        ),
     )
-    _EVENT_LEG_BUILT = True
+    _EVENT_LEG_CHAIN_BUILT = True
 
 
 @cache
-def _call_event_leg(start, velocity, live_y):
-    """Call the shared TitaniumEventLeg function; its five side-channel
-    outputs must be read out immediately (before this is called again for
-    another leg in the same tick) since they publish through a single
-    shared variable slot, not a per-call one — same constraint
-    ball_trajectory_graph's own segment chaining has."""
-    _build_event_leg_function()
-    goal_point = CustomFunction("TitaniumEventLeg", start, velocity, live_y)
+def _call_event_leg_chain(start, velocity, live_y, goal_x):
+    """Call the shared TitaniumEventLegChain function (up to 2 wall
+    bounces). Its two side-channel outputs (`is_threat`, `time`) must be
+    read immediately after this call, before any other call to this
+    function in the same tick — same single-shared-variable-slot
+    constraint as `_call_event_leg`."""
+    _build_event_leg_chain_function()
+    point = CustomFunction("TitaniumEventLegChain", start, velocity, live_y, goal_x)
     return {
-        "has_goal": GetVariable("_TitaniumEventLegHasGoal"),
-        "has_wall": GetVariable("_TitaniumEventLegHasWall"),
-        "event_time": GetVariable("_TitaniumEventLegEventTime"),
-        "goal_point": goal_point,
-        "contact": GetVariable("_TitaniumEventLegContact"),
-        "bounce_velocity": GetVariable("_TitaniumEventLegBounceVelocity"),
+        "is_threat": GetVariable("_TitaniumEventLegChainIsThreat"),
+        "time": GetVariable("_TitaniumEventLegChainTime"),
+        "point": point,
     }
 
 
@@ -330,20 +383,14 @@ def _own_goal_threat(ball, ball_vel, own_goal_x, goal_half_width):
     # point (ball glides `hang_time` seconds undecelerated first).
     landing_point = ball + velocity * hang_time
 
-    # ONE grounded segment only. A shot that bounces off a wall and then goes
-    # in is not a threat anyone can actually aim, so chasing that case is pure
-    # wasted node budget — the second `_event_leg` call is dropped. (Wall
-    # bounces are still modelled correctly by ball_trajectory_graph; we just
-    # do not predict *goals* through them.)
-    leg1 = _call_event_leg(landing_point, velocity, live_y)
-    # CustomFunction/GetVariable results come back typed "Any" in this
-    # library, so `.x` (which gates on self.type == "Vector3") would raise —
-    # Vector3Split has no such gate.
-    goal1_x = Vector3Split(leg1["goal_point"]).x
-    at_own_1 = CompareFloats(Abs(goal1_x - own_goal_x), Float(0.5), "<=")
-    ground_threat = And(leg1["has_goal"], at_own_1)
-    ground_time = hang_time + leg1["event_time"]
-    ground_point = leg1["goal_point"]
+    # Up to three grounded legs (two wall bounces). A shot that bounces off
+    # a wall and then crosses our goal line IS a real threat regardless of
+    # whether the bounce itself scores — it redirects the ball toward our
+    # goal, so we chase it rather than only the direct leg.
+    chain = _call_event_leg_chain(landing_point, velocity, live_y, own_goal_x)
+    ground_threat = chain["is_threat"]
+    ground_time = hang_time + chain["time"]
+    ground_point = chain["point"]
 
     is_threat = Or(airborne_threat, ground_threat)
     time = ConditionalSetFloat(airborne_threat, t_cross, ground_time)
@@ -402,35 +449,152 @@ def safe_walk_target(me, ball, desired, opponents, r_eff, step=5.5):
     return me + direction * Float(step)
 
 
-def clear_shot(shot_origin, opp_goal, opp_left_post, opp_right_post, opponents, r_eff):
-    """Is there a legal straight-line lane into the enemy goal right now, and
-    along which direction?
+def _release_catchable(shot_origin, opponents, interact_r):
+    """True if any opponent can grab the ball the instant it is released."""
+    catchable = Bool(False)
+    for opp in opponents:
+        near = CompareFloats(Distance(opp, shot_origin), interact_r, "<=")
+        catchable = Or(catchable, near)
+    return catchable
 
-    Candidates are the three directions that actually score: straight at the
-    goal centre, and the two post-tangent cone edges — the true min/max angle
-    corrected for post+ball radius, since a ball aimed at the raw corner
-    clips the post instead of going in. A candidate counts only if it also
-    clears every opponent's forbidden cone, so the lane is genuinely open
-    rather than merely goal-ward.
 
-    Centre is preferred whenever it is legal (largest margin for error); the
-    tangents are the fallback for when somebody is standing in the middle.
+def _opponent_can_intercept_shot(opp, origin, aim, goal_dist, interact_r):
+    """Can this opponent sprint-touch the ball on the origin→goal segment
+    before a full-charge shot arrives?
+
+    Closest point on the finite segment (not an infinite ray — defenders
+    past the goal must not veto a shot that has already crossed the line).
+    Opponents behind the release point are handled by `_release_catchable`,
+    not here.
+    """
+    along = DotProduct(opp - origin, aim)
+    along_clamped = ConditionalSetFloat(
+        CompareFloats(along, Float(0), "<"),
+        Float(0),
+        ConditionalSetFloat(CompareFloats(along, goal_dist, ">"), goal_dist, along),
+    )
+    closest = origin + aim * along_clamped
+    dist = Distance(opp, closest)
+    speed = ConditionalSetFloat(
+        CompareFloats(Float(FULL_SHOT_SPEED), Float(1e-3), "<"),
+        Float(1e-3),
+        Float(FULL_SHOT_SPEED),
+    )
+    t_ball = along_clamped / speed
+    gap = dist - interact_r
+    gap = ConditionalSetFloat(CompareFloats(gap, Float(0), "<"), Float(0), gap)
+    t_opp = gap / Float(SPRINT_SPEED)
+    ahead = CompareFloats(along_clamped, Float(1e-3), ">")
+    return And(ahead, CompareFloats(t_opp, t_ball, "<="))
+
+
+def _shot_aim_clear(origin, aim, opponents, interact_r, goal_dist):
+    blocked = Bool(False)
+    for opp in opponents:
+        blocked = Or(
+            blocked,
+            _opponent_can_intercept_shot(opp, origin, aim, goal_dist, interact_r),
+        )
+    return Not(blocked)
+
+
+def clear_shot(shot_origin, opp_goal, opp_left_post, opp_right_post, opponents, interact_r):
+    """Free shot into the enemy goal?
+
+    Only two gates: (1) nobody in interact radius at release, (2) nobody can
+    sprint-intercept the full-charge ball before it reaches the goal.
+    Prefer centre, then post tangents, then soft mids.
 
     Returns `(lane_open, aim_direction)`.
     """
     dir_c = unit_or_zero(opp_goal - shot_origin)
     dir_l, _ = post_tangent(shot_origin, opp_left_post, POST_CONTACT_RADIUS)
     dir_r, _ = post_tangent(shot_origin, opp_right_post, POST_CONTACT_RADIUS)
-    invariants = [
-        opponent_invariants(o, shot_origin, r_eff, opponent_half_angle(o, shot_origin, r_eff))
-        for o in opponents
-    ]
+    dir_ml = unit_or_zero(dir_c + dir_l)
+    dir_mr = unit_or_zero(dir_c + dir_r)
+    goal_dist = Distance(shot_origin, opp_goal)
+    release_ok = Not(_release_catchable(shot_origin, opponents, interact_r))
+
     best = dir_c
-    ok = is_legal_direction(dir_c, invariants)
-    for cand in (dir_l, dir_r):
-        legal = is_legal_direction(cand, invariants)
+    ok = Bool(False)
+    for cand in (dir_c, dir_l, dir_r, dir_ml, dir_mr):
+        legal = And(
+            release_ok,
+            _shot_aim_clear(shot_origin, cand, opponents, interact_r, goal_dist),
+        )
         take = And(legal, Not(ok))
         best = ConditionalSetVector3(take, cand, best)
+        ok = Or(ok, legal)
+    return ok, best
+
+
+# Desperado: ball must clear at least this many metres before an intercept
+# counts as "too early". Later intercepts are acceptable under pressure.
+DESPERADO_EARLY_M = 8.0
+# Must still point somewhat toward the enemy goal (never dump back at our net).
+DESPERADO_MIN_FORWARD = 0.35
+
+
+def _intercepted_too_early(origin, aim, opponents, interact_r, early_m=DESPERADO_EARLY_M):
+    bad = Bool(False)
+    for opp in opponents:
+        bad = Or(
+            bad,
+            _opponent_can_intercept_shot(opp, origin, aim, Float(early_m), interact_r),
+        )
+    return bad
+
+
+def desperado_forward_shot(
+    shot_origin, opp_goal, opp_left_post, opp_right_post, teammates, opponents, interact_r
+):
+    """Most-forward aim toward the enemy goal that is not intercepted too early.
+
+    Prefers scoring-cone directions, then slight swings around the goal axis.
+    Never picks a backward dump at our own half unless a teammate pass is the
+    only clear forward option (handled as a separate candidate toward a mate
+    with Dot(pass, goal_axis) >= DESPERADO_MIN_FORWARD).
+
+    Returns `(ok, aim)`.
+    """
+    fwd = unit_or_zero(opp_goal - shot_origin)
+    dir_c = fwd
+    dir_l, _ = post_tangent(shot_origin, opp_left_post, POST_CONTACT_RADIUS)
+    dir_r, _ = post_tangent(shot_origin, opp_right_post, POST_CONTACT_RADIUS)
+    dir_ml = unit_or_zero(dir_c + dir_l)
+    dir_mr = unit_or_zero(dir_c + dir_r)
+    # Bounded swings around the attack axis (±~20° / ±~40°) — still forward.
+    swing_a = Float(0.35)
+    swing_b = Float(0.70)
+    dir_a = unit_or_zero(rotate_xz(fwd, swing_a))
+    dir_b = unit_or_zero(rotate_xz(fwd, Float(0) - swing_a))
+    dir_c2 = unit_or_zero(rotate_xz(fwd, swing_b))
+    dir_d = unit_or_zero(rotate_xz(fwd, Float(0) - swing_b))
+
+    release_ok = Not(_release_catchable(shot_origin, opponents, interact_r))
+
+    candidates = [dir_c, dir_l, dir_r, dir_ml, dir_mr, dir_a, dir_b, dir_c2, dir_d]
+    # Forward passes to teammates that clear early intercept — only if the
+    # pass itself still advances toward their goal.
+    for mate in teammates:
+        candidates.append(unit_or_zero(mate - shot_origin))
+
+    best = fwd
+    best_score = Float(-2)
+    ok = Bool(False)
+    for cand in candidates:
+        forward = DotProduct(cand, fwd)
+        forward_ok = CompareFloats(forward, Float(DESPERADO_MIN_FORWARD), ">=")
+        clear_early = Not(
+            _intercepted_too_early(shot_origin, cand, opponents, interact_r)
+        )
+        legal = And(release_ok, And(forward_ok, clear_early))
+        better = And(
+            legal,
+            Or(Not(ok), CompareFloats(forward, best_score, ">")),
+        )
+        best = ConditionalSetVector3(better, cand, best)
+        best_score = ConditionalSetFloat(better, forward, best_score)
         ok = Or(ok, legal)
     return ok, best
 
@@ -509,36 +673,277 @@ def player_interact(player: int, has_ball: Node, shoot_now: Node):
     return Or(hold_charge, Or(grab, tackle))
 
 
-def build_carrier_move(me, ball, opp_goal, opp_left_post, opp_right_post, opponents, r_eff, has_ball, charge):
-    """With ball: walk a safe lane toward goal sitting on a full charge, and
-    on the tick a scoring lane opens snap MoveTo onto the aim direction.
+def build_carrier_move(
+    me,
+    ball,
+    opp_goal,
+    opp_left_post,
+    opp_right_post,
+    teammates,
+    opponents,
+    r_eff,
+    interact_r,
+    has_ball,
+    charge,
+):
+    """With ball: hold full charge; anti-tackle rotate; shoot/pass only when safe.
 
-    The snap *is* the aim — the engine kicks along MoveTo — so the release
-    and the snap have to land on the same tick. That is why `shoot_now` is
-    returned rather than recomputed: it must drive Interact too.
-
-    The `charge` gate is not optional. Releasing means dropping Interact, and
-    Interact is also what *builds* the charge — so firing the moment a lane
-    happens to be open (which, on pickup in space, is immediately) holds the
-    ball at zero charge forever: the engine needs >0.05 to kick at all, so
-    nothing is ever struck. Wait for the charge to actually be banked, then
-    spend it.
+    Priority when releasing:
+      1. Clear goal shot (no release-catch, no full-path intercept).
+      2. Escape pass to a teammate who wins the intercept race (delays tackle).
+      3. Desperado forward dump under pressure (not intercepted too early).
+    Between releases: MoveTo uses anti-tackle binary search so the held ball
+    stays outside every nearby opponent's interact bubble.
     """
-    # Shot origin is the CARRIER, not the ball's transform: the real engine
-    # visually orbits the held ball at an offset in front of the player, but
-    # the actual kick fires from the player's own center. Aiming the tangent
-    # geometry from `ball` (the offset position) instead of `me` was solving
-    # a slightly wrong triangle every time.
-    lane_ok, aim = clear_shot(me, opp_goal, opp_left_post, opp_right_post, opponents, r_eff)
+    fwd = unit_or_zero(opp_goal - me)
+    lane_ok, aim_clear = clear_shot(
+        me, opp_goal, opp_left_post, opp_right_post, opponents, interact_r
+    )
+    pass_ok, aim_pass = best_escape_pass(me, teammates, opponents, interact_r, fwd)
+    desp_ok, aim_desp = desperado_forward_shot(
+        me,
+        opp_goal,
+        opp_left_post,
+        opp_right_post,
+        teammates,
+        opponents,
+        interact_r,
+    )
     ready = CompareFloats(charge, Float(FULL_CHARGE), ">=")
-    shoot_now = And(has_ball, And(lane_ok, ready))
-    walk = safe_walk_target(me, ball, opp_goal, opponents, r_eff)
+    near_r = interact_r * Float(ANTI_TACKLE_NEAR_MULT)
+    danger = CompareFloats(nearest_opponent_dist(opponents, me), near_r, "<=")
+    pressure = CompareFloats(
+        nearest_opponent_dist(opponents, me),
+        interact_r * Float(2.5),
+        "<=",
+    )
+
+    shoot_clear = And(lane_ok, ready)
+    # Escape pass when a tackler is in the 1.5× bubble and anti-tackle alone
+    # may not be enough — only if a teammate truly wins the race to the ball.
+    shoot_pass = And(And(Not(lane_ok), And(pass_ok, danger)), ready)
+    shoot_desp = And(
+        And(Not(lane_ok), And(Not(pass_ok), And(desp_ok, pressure))),
+        ready,
+    )
+    shoot_now = And(has_ball, Or(shoot_clear, Or(shoot_pass, shoot_desp)))
+    aim = ConditionalSetVector3(
+        lane_ok,
+        aim_clear,
+        ConditionalSetVector3(And(Not(lane_ok), pass_ok), aim_pass, aim_desp),
+    )
+
+    # Anti-tackle: binary-search ±180° from the facing we actually want
+    # (toward goal), until the held ball sits outside every opponent's
+    # interact radius. If full clearance is impossible, prefer drain-only
+    # contact over a winning steal.
+    my_stam = SoccerGetFloat("Ball Carrier Stamina")
+    walk_dir = anti_tackle_facing(me, fwd, opponents, interact_r, my_stam)
+    walk = me + walk_dir * Float(5.5)
     shoot_to = me + aim * Float(10)
     move = ConditionalSetVector3(shoot_now, shoot_to, walk)
-    # Without ball: chase ball with same cone (avoid running through tacklers).
     chase = safe_walk_target(me, ball, ball, opponents, r_eff, step=8.0)
     move = ConditionalSetVector3(has_ball, move, chase)
     return move, shoot_now
+
+
+def nearest_opponent_body(opponents, me):
+    """Closest opponent BODY to `me`, plus that distance."""
+    nearest = opponents[0]
+    best_d = Distance(me, opponents[0])
+    for opp in opponents[1:]:
+        d = Distance(me, opp)
+        nearer = CompareFloats(d, best_d, "<")
+        nearest = ConditionalSetVector3(nearer, opp, nearest)
+        best_d = ConditionalSetFloat(nearer, d, best_d)
+    return nearest, best_d
+
+
+def face_away_from_nearest(me, opponents):
+    """Unit facing 180° from the nearest opponent (held-ball swings off them)."""
+    nearest, best_d = nearest_opponent_body(opponents, me)
+    return unit_or_zero(me - nearest), best_d
+
+
+def facing_contact_flags(me, facing, opponents, interact_r, carrier_stam):
+    """Whether this facing puts the held ball inside anyone's interact radius.
+
+    Returns (clear_all, clear_steal):
+      clear_all   — ball outside every opponent's interact radius
+      clear_steal — ball outside interact of anyone who would WIN the duel
+                    (opp_stam >= ours); a weaker opp may still drain stamina
+    """
+    facing_u = unit_or_zero(facing)
+    hold = Float(HOLD_OFFSET_M)
+    # Anyone farther than hold+interact cannot reach the held ball.
+    reach = hold + interact_r
+    ball_now = me + facing_u * hold
+    ball_next = me + facing_u * (hold + Float(WALK_SPEED) * Float(0.08))
+    opp_stams = [SoccerGetFloat(f"Opponent Player {i} Stamina") for i in range(1, 5)]
+    clear_all = Bool(True)
+    clear_steal = Bool(True)
+    for opp, stam in zip(opponents, opp_stams):
+        can_reach = CompareFloats(Distance(me, opp), reach, "<=")
+        hit_now = CompareFloats(Distance(ball_now, opp), interact_r, "<=")
+        hit_next = CompareFloats(Distance(ball_next, opp), interact_r, "<=")
+        hit = And(can_reach, Or(hit_now, hit_next))
+        can_steal = CompareFloats(stam, carrier_stam, ">=")
+        clear_all = And(clear_all, Not(hit))
+        clear_steal = And(clear_steal, Not(And(hit, can_steal)))
+    return clear_all, clear_steal
+
+
+def _anti_tackle_sample_degrees():
+    """Unrolled binary-search angles in ±180° around desired facing.
+
+    Dyadic midpoints of [0, 180] (five levels → 11.25°), both signs — a
+    graph-safe stand-in for a real binary-search loop over yaw. Keeps the
+    node count bounded while still converging on the smallest safe turn.
+    """
+    mags = [0.0]
+    for level in range(0, 5):
+        step = 180.0 / (2**level)
+        for k in range(1, 2**level + 1):
+            m = k * step
+            if m <= 180.0 + 1e-9 and all(abs(m - x) > 1e-4 for x in mags):
+                mags.append(float(m))
+    out = []
+    for m in mags:
+        out.append(m)
+        if m > 1e-6:
+            out.append(-m)
+    return tuple(out)
+
+
+def anti_tackle_facing(me, desired, opponents, interact_r, carrier_stam):
+    """Binary-search ±180° from `desired` until the held ball is untackleable.
+
+    Goal: rotate as little as possible from the facing we want to hold, such
+    that the ball (hold-offset along facing) is outside every opponent's
+    interact radius. If that is impossible, fall back to clear-of-stealers
+    (drain-only), then least-bad. Within a tier, smallest |yaw| wins.
+    """
+    desired_u = unit_or_zero(desired)
+    best = desired_u
+    best_tier = Float(-1)
+    best_abs = Float(999)
+    best_dot = Float(-2)
+    for deg in _anti_tackle_sample_degrees():
+        cand = unit_or_zero(rotate_xz(desired_u, Float(math.radians(deg))))
+        clear_all, clear_steal = facing_contact_flags(
+            me, cand, opponents, interact_r, carrier_stam
+        )
+        tier = ConditionalSetFloat(
+            clear_all,
+            Float(2),
+            ConditionalSetFloat(clear_steal, Float(1), Float(0)),
+        )
+        abs_deg = Float(abs(deg))
+        dot = DotProduct(cand, desired_u)
+        better_tier = CompareFloats(tier, best_tier, ">")
+        same_tier = And(
+            Not(CompareFloats(tier, best_tier, "<")),
+            Not(CompareFloats(tier, best_tier, ">")),
+        )
+        better_abs = And(same_tier, CompareFloats(abs_deg, best_abs, "<"))
+        same_abs = And(
+            same_tier,
+            And(
+                Not(CompareFloats(abs_deg, best_abs, "<")),
+                Not(CompareFloats(abs_deg, best_abs, ">")),
+            ),
+        )
+        better_dot = And(same_abs, CompareFloats(dot, best_dot, ">"))
+        better = Or(better_tier, Or(better_abs, better_dot))
+        best = ConditionalSetVector3(better, cand, best)
+        best_tier = ConditionalSetFloat(better, tier, best_tier)
+        best_abs = ConditionalSetFloat(better, abs_deg, best_abs)
+        best_dot = ConditionalSetFloat(better, dot, best_dot)
+    return best
+
+
+def best_escape_pass(me, teammates, opponents, interact_r, attack_fwd):
+    """Pass to a teammate who reaches the ball before any opponent.
+
+    Used when a tackler is inside the 1.5× bubble and we need to delay the
+    loss. Aim must not be catchable at release, and no opponent may
+    intercept the segment me→mate before the ball arrives.
+    """
+    release_ok = Not(_release_catchable(me, opponents, interact_r))
+    best = attack_fwd
+    best_score = Float(-2)
+    ok = Bool(False)
+    for mate in teammates:
+        dist = Distance(me, mate)
+        not_self = CompareFloats(dist, Float(0.75), ">")
+        aim = unit_or_zero(mate - me)
+        # Teammate (or any teammate on the path) wins: no enemy intercept.
+        clear = _shot_aim_clear(me, aim, opponents, interact_r, dist)
+        forward = DotProduct(aim, attack_fwd)
+        legal = And(
+            release_ok,
+            And(not_self, And(clear, CompareFloats(forward, Float(-0.15), ">="))),
+        )
+        better = And(legal, Or(Not(ok), CompareFloats(forward, best_score, ">")))
+        best = ConditionalSetVector3(better, aim, best)
+        best_score = ConditionalSetFloat(better, forward, best_score)
+        ok = Or(ok, legal)
+    return ok, best
+
+
+def lackey_station(carrier, opp_goal):
+    """Close outlet behind the ball — always one guaranteed safe-pass body."""
+    fwd = unit_or_zero(opp_goal - carrier)
+    return carrier - fwd * Float(LACKEY_STANDOFF_M)
+
+
+def post_intercept_threat_times(opponents, team_goal, interact_r, our_carrier, carrier_stam):
+    """Clocks for: enemy reaches our carrier, steals, then shoots / relays.
+
+    Tackle rule: winner needs `tackler_stam >= carrier_stam`. Opponents with
+    strictly less stamina cannot take the ball — their steal clock is pushed
+    to infinity so we neither cover nor panic about a duel they cannot win.
+    (Sacrifice drains are ignored here; those do not produce a turnover yet.)
+
+    Always computed; callers pick when this dominates the live ETA.
+    """
+    times = []
+    opp_stams = [SoccerGetFloat(f"Opponent Player {i} Stamina") for i in range(1, 5)]
+    impossible = Float(999.0)
+    for i, opp in enumerate(opponents):
+        gap = Distance(opp, our_carrier) - interact_r
+        gap = ConditionalSetFloat(CompareFloats(gap, Float(0), "<"), Float(0), gap)
+        t_arrive = gap / Float(SPRINT_SPEED)
+        t_shot = threat_eta_to_goal(opp, team_goal)
+        t_after = t_shot
+        for mate in opponents:
+            t_relay = threat_eta_pass_then_shot(opp, mate, team_goal)
+            t_after = ConditionalSetFloat(
+                CompareFloats(t_relay, t_after, "<"), t_relay, t_after
+            )
+        can_steal = CompareFloats(opp_stams[i], carrier_stam, ">=")
+        times.append(
+            ConditionalSetFloat(can_steal, t_arrive + t_after, impossible)
+        )
+    return times
+
+
+def loose_race_threat_times(opponents, ball, team_goal, interact_r):
+    """Clocks for: enemy wins the loose ball, then shoots / pass-then-shoots."""
+    times = []
+    for opp in opponents:
+        gap = Distance(opp, ball) - interact_r
+        gap = ConditionalSetFloat(CompareFloats(gap, Float(0), "<"), Float(0), gap)
+        t_arrive = gap / Float(SPRINT_SPEED)
+        t_shot = threat_eta_to_goal(opp, team_goal)
+        t_after = t_shot
+        for mate in opponents:
+            t_relay = threat_eta_pass_then_shot(opp, mate, team_goal)
+            t_after = ConditionalSetFloat(
+                CompareFloats(t_relay, t_after, "<"), t_relay, t_after
+            )
+        times.append(t_arrive + t_after)
+    return times
 
 
 def gk_cover_stand(shot_origin, team_goal, left_post, right_post, interact_r, charge=None):
@@ -616,18 +1021,256 @@ def threat_cover(opp_pos, team_goal, left_post, right_post, interact_r):
 
 
 def clamp_own_half(p, team_goal):
-    """Keep a point on our side of the halfway line.
+    """Keep a point on our side of the halfway line (champion GK behaviour).
 
-    The keeper is allowed to press the carrier aggressively, but stepping
-    over midfield to do it means an interception behind him is an open net.
-    Team space is not sign-stable across home/away, so derive the side from
-    our own goal's x rather than assuming one.
+    Team Goal Center is WORLD (home ≈ −40, away ≈ +40); defended side follows
+    its sign.
     """
     defends_negative = CompareFloats(team_goal.x, Float(0), "<")
     clamp_neg = ConditionalSetFloat(CompareFloats(p.x, Float(0), ">"), Float(0), p.x)
     clamp_pos = ConditionalSetFloat(CompareFloats(p.x, Float(0), "<"), Float(0), p.x)
     x = ConditionalSetFloat(defends_negative, clamp_neg, clamp_pos)
     return Vector3(x, p.y, p.z)
+
+
+def flight_eta(origin, target):
+    """Seconds for a full-charge ball to cover origin→target (straight)."""
+    speed = ConditionalSetFloat(
+        CompareFloats(Float(FULL_SHOT_SPEED), Float(1e-3), "<"),
+        Float(1e-3),
+        Float(FULL_SHOT_SPEED),
+    )
+    return Distance(origin, target) / speed
+
+
+def threat_eta_to_goal(origin, goal):
+    """ETA for a full-charge shot from `origin` to land in `goal`."""
+    return flight_eta(origin, goal)
+
+
+def threat_eta_pass_then_shot(passer, receiver, goal):
+    """ETA for pass passer→receiver, then full-charge shot receiver→goal."""
+    return flight_eta(passer, receiver) + flight_eta(receiver, goal)
+
+
+def urgency_rank(i, times):
+    """How many threats are more urgent than times[i] (0 = soonest).
+
+    Ties break toward the lower index so ranks are a unique permutation.
+    """
+    rank = Float(0)
+    ti = times[i]
+    for j, tj in enumerate(times):
+        if j == i:
+            continue
+        sooner = CompareFloats(tj, ti, "<")
+        if j < i:
+            equal = And(
+                Not(CompareFloats(tj, ti, "<")),
+                Not(CompareFloats(ti, tj, "<")),
+            )
+            sooner = Or(sooner, equal)
+        rank = rank + ConditionalSetFloat(sooner, Float(1), Float(0))
+    return rank
+
+
+def threat_times_and_covers(
+    opponents,
+    has_bits,
+    carrier,
+    team_goal,
+    left_post,
+    right_post,
+    interact_r,
+    our_carrier,
+    team_has,
+    opp_has,
+    ball,
+    loose,
+):
+    """Per-opponent ETA + seal, for EVERY possession state.
+
+    - Enemy has ball: 2-ply from their carrier (direct / pass-then-shot).
+    - We have ball: steal ETA + threats generated after that intercept.
+    - Loose: race-to-ball ETA + threats after they claim it.
+
+    Always a live clock — not only when they already own the ball.
+    """
+    times = []
+    covers = []
+    # Stamina of OUR holder (by has-bit), not Ball Carrier Stamina — that
+    # label tracks whoever currently holds, including the opponent.
+    our_stams = [SoccerGetFloat(f"Team Player {i} Stamina") for i in range(1, 5)]
+    our_has = [SoccerGetBool(f"Team Player {i} Has Ball") for i in range(1, 5)]
+    our_carrier_stam = our_stams[0]
+    for i in range(4):
+        our_carrier_stam = ConditionalSetFloat(our_has[i], our_stams[i], our_carrier_stam)
+    post = post_intercept_threat_times(
+        opponents, team_goal, interact_r, our_carrier, our_carrier_stam
+    )
+    race = loose_race_threat_times(opponents, ball, team_goal, interact_r)
+    for i, opp in enumerate(opponents):
+        t_direct = threat_eta_to_goal(opp, team_goal)
+        t_relay = threat_eta_pass_then_shot(carrier, opp, team_goal)
+        t_possess = ConditionalSetFloat(has_bits[i], t_direct, t_relay)
+        t = ConditionalSetFloat(
+            opp_has,
+            t_possess,
+            ConditionalSetFloat(team_has, post[i], race[i]),
+        )
+        t = ConditionalSetFloat(Or(opp_has, Or(team_has, loose)), t, t_possess)
+        times.append(t)
+        covers.append(threat_cover(opp, team_goal, left_post, right_post, interact_r))
+        TimePlot(String(f"Titanium.Threat{i+1}.Eta"), "Red", String(""), t)
+        TimePlot(String(f"Titanium.Threat{i+1}.StealEta"), "Orange", String(""), post[i])
+        TimePlot(String(f"Titanium.Threat{i+1}.LooseEta"), "Yellow", String(""), race[i])
+    return times, covers
+
+
+def stand_seals_shot(stand, shot_origin, team_goal, left_post, right_post, interact_r):
+    """True if `stand` already cuts both post-tangent extremes of this shot."""
+    to_l, _ = post_tangent(shot_origin, left_post, POST_CONTACT_RADIUS)
+    to_r, _ = post_tangent(shot_origin, right_post, POST_CONTACT_RADIUS)
+    to_g = unit_or_zero(stand - shot_origin)
+    between = CompareFloats(Distance(stand, team_goal), Distance(shot_origin, team_goal), "<=")
+    dist_sb = Magnitude(stand - shot_origin)
+    cross_l = Abs(to_g.x * to_l.z - to_g.z * to_l.x)
+    cross_r = Abs(to_g.x * to_r.z - to_g.z * to_r.x)
+    cut_l = CompareFloats(cross_l * dist_sb, interact_r, "<=")
+    cut_r = CompareFloats(cross_r * dist_sb, interact_r, "<=")
+    return And(between, And(cut_l, cut_r))
+
+
+def threat_already_sealed(teammates, shot_origin, team_goal, left_post, right_post, interact_r):
+    """Any teammate body already seals this opponent's shot cone."""
+    sealed = Bool(False)
+    for mate in teammates:
+        sealed = Or(
+            sealed,
+            stand_seals_shot(mate, shot_origin, team_goal, left_post, right_post, interact_r),
+        )
+    return sealed
+
+
+def unsealed_urgency_rank(i, times, sealed_flags):
+    """Urgency rank among threats that are NOT already sealed (0 = soonest open).
+
+    Sealed threats get a huge rank so nobody is assigned to babysit them.
+    """
+    huge = Float(99)
+    base = ConditionalSetFloat(sealed_flags[i], huge, Float(0))
+    # If sealed, skip counting — return huge.
+    # If open: count other open threats that are more urgent.
+    rank = Float(0)
+    ti = times[i]
+    for j, tj in enumerate(times):
+        if j == i:
+            continue
+        # j beats i in urgency (same tie-break as urgency_rank)
+        sooner = CompareFloats(tj, ti, "<")
+        if j < i:
+            equal = And(
+                Not(CompareFloats(tj, ti, "<")),
+                Not(CompareFloats(ti, tj, "<")),
+            )
+            sooner = Or(sooner, equal)
+        open_j = Not(sealed_flags[j])
+        rank = rank + ConditionalSetFloat(And(open_j, sooner), Float(1), Float(0))
+    return ConditionalSetFloat(sealed_flags[i], huge, rank)
+
+
+def cover_or_intercept(
+    want_rank,
+    times,
+    covers,
+    sealed_flags,
+    me,
+    ball,
+    ball_vel,
+):
+    """Cover the want_rank-th still-open threat; else free to intercept the ball.
+
+    Once every danger cone is already sealed by a teammate, spare defenders
+    stop standing on redundant marks and go win the ball instead.
+    """
+    intercept = predict_ball_meet_point(me, ball, ball_vel, SPRINT_SPEED)
+    move = intercept
+    assigned = Bool(False)
+    for i, cover in enumerate(covers):
+        mine = CompareFloats(
+            unsealed_urgency_rank(i, times, sealed_flags), Float(want_rank), "=="
+        )
+        take = And(mine, Not(assigned))
+        move = ConditionalSetVector3(take, cover, move)
+        assigned = Or(assigned, mine)
+    # If nothing open left for this slot, stay on intercept.
+    move = ConditionalSetVector3(assigned, move, intercept)
+    return move, assigned
+
+
+def aggressive_press_with_cover(me, cover_move, on_cover, carrier, interact_r):
+    """Presser: always press the holder; seal only if cheap.
+
+    Against a stalling midfield carrier the low-urgency seal is often a
+    camping spot far from the ball. Primary job is to go win it. If the
+    assigned seal is nearly on the way to the carrier, or already sits in
+    their interact bubble / shot apex, take that point first — press and
+    a leftover cone at once.
+    """
+    direct = Distance(me, carrier)
+    via = Distance(me, cover_move) + Distance(cover_move, carrier)
+    detour = via - direct
+    cheap_detour = CompareFloats(detour, Float(5.0), "<=")
+    seal_near_carrier = CompareFloats(
+        Distance(cover_move, carrier), interact_r * Float(2.5), "<="
+    )
+    use_seal = And(on_cover, Or(cheap_detour, seal_near_carrier))
+    return ConditionalSetVector3(use_seal, cover_move, carrier)
+
+
+def outfield_press_roles(outfield, carrier_stam, carrier_body):
+    """Who presses vs who covers, with a clean role swap.
+
+    Nominal flanker is P3 (least-urgent cone). Only an outfielder who can
+    *win* the stamina duel (`stam >= carrier_stam`) may be sent to tackle.
+    Prefer P3 when they qualify; otherwise the closest capable outfielder
+    presses, and P3 inherits that player's cover urgency so the marks stay
+    filled. If nobody can win the duel, nobody presses — never send a body
+    that will only burn stamina and lose.
+    """
+    # slots 1..3 only (GK keeps its own press path)
+    stam = [SoccerGetFloat(f"Team Player {i} Stamina") for i in range(1, 4)]
+    can = [CompareFloats(stam[i], carrier_stam, ">=") for i in range(3)]
+    dist = [Distance(outfield[i], carrier_body) for i in range(3)]
+    any_can = Or(Or(can[0], can[1]), can[2])
+
+    # Prefer capable P3; else closest capable among P1/P2.
+    # Distance key + tiny slot epsilon → exactly one presser.
+    key = [dist[i] + Float((i + 1) * 0.0001) for i in range(3)]
+    prefer3 = can[2]
+    is_p3 = And(any_can, prefer3)
+    p1_beats_p2 = Or(Not(can[1]), CompareFloats(key[0], key[1], "<"))
+    is_p1 = And(any_can, And(Not(prefer3), And(can[0], p1_beats_p2)))
+    is_p2 = And(any_can, And(Not(prefer3), And(can[1], Not(is_p1))))
+    is_presser = [is_p1, is_p2, is_p3]
+
+    # Cover urgency remap: default P1→0, P2→1, P3→2.
+    # When P1 presses, P3 takes urgency 0. When P2 presses, P3 takes 1.
+    u1 = Float(0)
+    u2 = Float(1)
+    u3 = Float(2)
+    u3 = ConditionalSetFloat(is_p1, Float(0), u3)
+    u3 = ConditionalSetFloat(is_p2, Float(1), u3)
+    return is_presser, [u1, u2, u3], any_can
+
+
+def cover_for_urgency_rank(want_rank, times, covers):
+    """MoveTo = seal for the threat whose urgency rank == want_rank (0=soonest)."""
+    move = covers[0]
+    for i, cover in enumerate(covers):
+        mine = CompareFloats(urgency_rank(i, times), Float(want_rank), "==")
+        move = ConditionalSetVector3(mine, cover, move)
+    return move
 
 
 def opponent_carrier(opponents, ball):
@@ -649,6 +1292,92 @@ def opponent_carrier(opponents, ball):
         nearest = ConditionalSetVector3(nearer, opp, nearest)
         nearest_d = ConditionalSetFloat(nearer, d, nearest_d)
     return ConditionalSetVector3(has_any, carrier, nearest)
+
+
+def team_carrier(players):
+    """Our BODY position currently holding the ball (no loose fallback)."""
+    has_bits = [SoccerGetBool(f"Team Player {i} Has Ball") for i in range(1, 5)]
+    carrier = players[-1]
+    for p, has in zip(players, has_bits):
+        carrier = ConditionalSetVector3(has, p, carrier)
+    return carrier, has_bits
+
+
+def draw_2ply_threat_tree(
+    carrier,
+    bodies,
+    has_bits,
+    goal_center,
+    left_post,
+    right_post,
+    active,
+    shot_color: str,
+    pass_color: str,
+    eta_prefix: str,
+):
+    """Debug-draw the immediate 2-ply possession tree from `carrier`.
+
+    Always drawn (both sides) — ETA channels / cover logic decide which
+    threats are live. Collapsing on possession made enemy trees vanish the
+    moment we held the ball, which hid steal→shot threats.
+    """
+    # Force visible every tick; `active` kept for API compat but ignored.
+    _ = active
+    on = Bool(True)
+    collapse = carrier
+
+    def gate(p, _on=None):
+        return p
+
+    origin_on = carrier
+    _, aim_l = post_tangent(carrier, left_post, POST_CONTACT_RADIUS)
+    _, aim_r = post_tangent(carrier, right_post, POST_CONTACT_RADIUS)
+    DebugDrawLine(origin_on, aim_l, Float(0.06), shot_color)
+    DebugDrawLine(origin_on, aim_r, Float(0.06), shot_color)
+    DebugDrawDisc(aim_l, Float(0.15), Float(0.05), shot_color)
+    DebugDrawDisc(aim_r, Float(0.15), Float(0.05), shot_color)
+    t_direct = threat_eta_to_goal(carrier, goal_center)
+    TimePlot(String(f"{eta_prefix}.DirectShot.Eta"), shot_color, String(""), t_direct)
+
+    for i, mate in enumerate(bodies):
+        mate_on = Not(has_bits[i])
+        # Still skip drawing self-pass to the carrier body.
+        mate_pt = ConditionalSetVector3(mate_on, mate, carrier)
+        DebugDrawLine(origin_on, mate_pt, Float(0.045), pass_color)
+        DebugDrawDisc(mate_pt, Float(0.18), Float(0.04), pass_color)
+        t_pass = ConditionalSetFloat(mate_on, flight_eta(carrier, mate), Float(0))
+        TimePlot(String(f"{eta_prefix}.Pass{i+1}.Eta"), pass_color, String(""), t_pass)
+
+        _, m_l = post_tangent(mate, left_post, POST_CONTACT_RADIUS)
+        _, m_r = post_tangent(mate, right_post, POST_CONTACT_RADIUS)
+        DebugDrawLine(mate_pt, ConditionalSetVector3(mate_on, m_l, carrier), Float(0.05), shot_color)
+        DebugDrawLine(mate_pt, ConditionalSetVector3(mate_on, m_r, carrier), Float(0.05), shot_color)
+        t_then_shot = ConditionalSetFloat(
+            mate_on, threat_eta_pass_then_shot(carrier, mate, goal_center), Float(0)
+        )
+        TimePlot(
+            String(f"{eta_prefix}.Pass{i+1}ThenShot.Eta"), shot_color, String(""), t_then_shot
+        )
+
+        for j, other in enumerate(bodies):
+            if j == i:
+                continue
+            other_on = And(mate_on, Not(has_bits[j]))
+            DebugDrawLine(
+                mate_pt,
+                ConditionalSetVector3(other_on, other, carrier),
+                Float(0.03),
+                pass_color,
+            )
+            t_relay = ConditionalSetFloat(
+                other_on, flight_eta(carrier, mate) + flight_eta(mate, other), Float(0)
+            )
+            TimePlot(
+                String(f"{eta_prefix}.Pass{i+1}to{j+1}.Eta"),
+                pass_color,
+                String(""),
+                t_relay,
+            )
 
 
 @cache
@@ -852,6 +1581,12 @@ def gk_policy(
         IsNull(clear_dir), pos("Opponent Goal Center"), clear_target
     )
     clear_spot = safe_walk_target(gk, ball, clear_target, opponents, r_eff, step=14)
+    # Post-tackle: same 180° face-away as outfield — do not stroll through the
+    # player you just dispossessed with the ball still on their side.
+    away_gk, d_near_gk = face_away_from_nearest(gk, opponents)
+    post_tackle_gk = CompareFloats(d_near_gk, interact_r * Float(1.4), "<=")
+    escape_gk = gk + away_gk * Float(10)
+    clear_spot = ConditionalSetVector3(post_tackle_gk, escape_gk, clear_spot)
     move = ConditionalSetVector3(has_ball, clear_spot, cover)
 
     # Sprint ONLY to intercept a free ball whose predicted path crosses our
@@ -904,13 +1639,8 @@ def gk_policy(
     move = ConditionalSetVector3(And(go_to_ball, chase_ok), chase_target_gk, move)
     move = ConditionalSetVector3(And(nearby, Not(has_ball)), ball, move)
 
-    # The keeper never crosses midfield, however tempting the press or a
-    # loose ball upfield looks — being beaten past the halfway line leaves an
-    # open net behind him, and the outfield cover players exist to handle
-    # anything out there.
-    #
-    # Deliberately NOT applied while carrying: the kick fires along MoveTo, so
-    # clamping x would rotate the clear aim back toward our own goal.
+    # Champion behaviour: keep P4 on our half when not carrying (kick aim must
+    # not be clamped — Interact release fires along MoveTo).
     move = ConditionalSetVector3(has_ball, move, clamp_own_half(move, team_goal))
 
     # Same permanent-full-charge policy as everyone else: hold the ball on a
@@ -952,7 +1682,7 @@ def main() -> None:
     # allowed to be. P2 distance sqrt(5^2+7^2)=8.6, P3 distance 11, P4
     # distance 36 — all clear of the r=7.25 circle.
     InitializeSoccer(
-        "Titanium",
+        "Titanium_test",
         "Poland",
         Vector3(Float(0), Float(0), Float(2)),
         Vector3(Float(-5), Float(0), Float(7)),
@@ -968,29 +1698,11 @@ def main() -> None:
     opp_left_post = pos("Opponent Goal Left Post")
     opp_right_post = pos("Opponent Goal Right Post")
 
-    # Debug: true (post-tangent corrected) min/max straight-line shot cone
-    # from the ball, at both goals. Green = cone into the enemy goal (what
-    # we could score with right now); red = cone into our own goal (the
-    # danger cone the GK must seal). Uses the existing DebugDrawLine /
-    # DebugDrawDisc nodes AIA exposes — no custom node types added.
-    _, enemy_aim_l = post_tangent(ball, opp_left_post, POST_CONTACT_RADIUS)
-    _, enemy_aim_r = post_tangent(ball, opp_right_post, POST_CONTACT_RADIUS)
-    DebugDrawLine(ball, enemy_aim_l, Float(0.06), "Green")
-    DebugDrawLine(ball, enemy_aim_r, Float(0.06), "Green")
-    DebugDrawDisc(enemy_aim_l, Float(0.15), Float(0.05), "Green")
-    DebugDrawDisc(enemy_aim_r, Float(0.15), Float(0.05), "Green")
-
-    _, own_aim_l = post_tangent(ball, left_post, POST_CONTACT_RADIUS)
-    _, own_aim_r = post_tangent(ball, right_post, POST_CONTACT_RADIUS)
-    DebugDrawLine(ball, own_aim_l, Float(0.06), "Red")
-    DebugDrawLine(ball, own_aim_r, Float(0.06), "Red")
-    DebugDrawDisc(own_aim_l, Float(0.15), Float(0.05), "Red")
-    DebugDrawDisc(own_aim_r, Float(0.15), Float(0.05), "Red")
-
     p1 = pos("Team Player 1")
     p2 = pos("Team Player 2")
     p3 = pos("Team Player 3")
     p4 = pos("Team Player 4")
+    team = [p1, p2, p3, p4]
 
     opponents = [
         pos("Opponent Player 1"),
@@ -998,6 +1710,59 @@ def main() -> None:
         pos("Opponent Player 3"),
         pos("Opponent Player 4"),
     ]
+
+    team_has = SoccerGetBool("Team Has Ball")
+    opp_has = SoccerGetBool("Opponent Has Ball")
+    loose = SoccerGetBool("Is Ball Loose")
+
+    # --- Threat / option debug (always on while the ball is held) ---
+    #
+    # The old green/red cones were rooted at the Ball transform. The moment
+    # anyone picks up, that point is a held-ball offset orbiting the carrier,
+    # so the cones skew or look like they vanished. Root everything at the
+    # carrier BODY and expand to a 2-ply minimax surface instead:
+    #   ply 0: direct shot cone + pass to each teammate
+    #   ply 1: from each teammate, shot cone + pass to every other teammate
+    # Red/Orange = enemy threats at our goal. Green/Cyan = our options at theirs.
+    # Loose ball keeps the simple ball-rooted cones (no holder to tree from).
+    # Always draw BOTH threat trees (ours + enemy). Possession only changes
+    # which ETA path is live for covering — not whether the lines exist.
+    always = Bool(True)
+    opp_has_bits = [SoccerGetBool(f"Opponent Player {i} Has Ball") for i in range(1, 5)]
+    draw_2ply_threat_tree(
+        opponent_carrier(opponents, ball),
+        opponents,
+        opp_has_bits,
+        team_goal,
+        left_post,
+        right_post,
+        always,
+        "Red",
+        "Orange",
+        "Titanium.Enemy",
+    )
+    our_carrier, team_has_bits = team_carrier(team)
+    draw_2ply_threat_tree(
+        our_carrier,
+        team,
+        team_has_bits,
+        opp_goal,
+        opp_left_post,
+        opp_right_post,
+        always,
+        "Green",
+        "Light Blue",
+        "Titanium.Attack",
+    )
+    _, loose_enemy_l = post_tangent(ball, opp_left_post, POST_CONTACT_RADIUS)
+    _, loose_enemy_r = post_tangent(ball, opp_right_post, POST_CONTACT_RADIUS)
+    _, loose_own_l = post_tangent(ball, left_post, POST_CONTACT_RADIUS)
+    _, loose_own_r = post_tangent(ball, right_post, POST_CONTACT_RADIUS)
+    DebugDrawLine(ball, ConditionalSetVector3(loose, loose_enemy_l, ball), Float(0.06), "Green")
+    DebugDrawLine(ball, ConditionalSetVector3(loose, loose_enemy_r, ball), Float(0.06), "Green")
+    DebugDrawLine(ball, ConditionalSetVector3(loose, loose_own_l, ball), Float(0.06), "Red")
+    DebugDrawLine(ball, ConditionalSetVector3(loose, loose_own_r, ball), Float(0.06), "Red")
+
     for i, opp in enumerate(opponents, start=1):
         plot_xz(f"Titanium.Opp{i}.Pos", "Red", opp)
     # Diagnostic: does SoccerGetVector3("Ball Velocity") actually read a live
@@ -1011,10 +1776,6 @@ def main() -> None:
     r_eff = r_int + Float(BALL_RADIUS)
 
     ball_vel = SoccerGetVector3("Ball Velocity")
-    team_has = SoccerGetBool("Team Has Ball")
-    opp_has = SoccerGetBool("Opponent Has Ball")
-    loose = SoccerGetBool("Is Ball Loose")
-
     # --- Outfield players 1-3: multi-body goalkeeper ---
     #
     # The team defends as one keeper with four bodies. When the opponent has
@@ -1039,26 +1800,104 @@ def main() -> None:
     # ahead of the ball to stretch the defence, one trailing goal-side as the
     # safe backward outlet (which is also the receiver the carrier will look
     # for when it cannot escape a tackle).
+    # Enemy 2-ply clocks + seal points, ordered most→least immediate for the
+    # three outfielders (rank 0/1/2). P4 still presses the carrier directly.
+    threat_times, threat_covers = threat_times_and_covers(
+        opponents,
+        opp_has_bits,
+        opponent_carrier(opponents, ball),
+        team_goal,
+        left_post,
+        right_post,
+        r_int,
+        our_carrier,
+        team_has,
+        opp_has,
+        ball,
+        loose,
+    )
+    # Which cones are already sealed by somebody (incl. P4) — spare outfielders
+    # are then free to intercept instead of double-marking.
+    threat_sealed = [
+        threat_already_sealed(team, opp, team_goal, left_post, right_post, r_int)
+        for opp in opponents
+    ]
+
     fwd = unit_or_zero(opp_goal - ball)
     lat = Vector3(Float(0) - fwd.z, Float(0), fwd.x)
+    # P3 is the lackey: glued behind the carrier for a guaranteed escape pass.
+    lackey_pos = lackey_station(our_carrier, opp_goal)
 
-    for slot, me, marks, ahead, side in (
-        (1, p1, opponents[0], 9.0, 7.0),
-        (2, p2, opponents[1], 9.0, -7.0),
-        (3, p3, opponents[2], -6.0, 0.0),
+    # Flanker/press role: only a body that can WIN the stamina duel is sent.
+    # Soft P3 by default; if they're spent, closest capable outfielder presses
+    # and P3 inherits that player's cover urgency (clean swap).
+    opp_carrier_body = opponent_carrier(opponents, ball)
+    opp_carrier_stam = SoccerGetFloat("Ball Carrier Stamina")
+    press_flags, cover_urgencies, any_presser = outfield_press_roles(
+        [p1, p2, p3], opp_carrier_stam, opp_carrier_body
+    )
+
+    for slot, me, ahead, side in (
+        (1, p1, 9.0, 7.0),
+        (2, p2, 9.0, -7.0),
+        (3, p3, -6.0, 0.0),
     ):
         has = SoccerGetBool(f"Team Player {slot} Has Ball")
         charge = SoccerGetFloat(f"Teammate {slot} Shot Charge")
         closest = SoccerGetBool(f"Is Team Player {slot} Closest Teammate to Ball")
+        urgency = cover_urgencies[slot - 1]
+        i_am_presser = press_flags[slot - 1]
 
         carry, shoot_now = build_carrier_move(
-            me, ball, opp_goal, opp_left_post, opp_right_post, opponents, r_eff, has, charge
+            me,
+            ball,
+            opp_goal,
+            opp_left_post,
+            opp_right_post,
+            team,
+            opponents,
+            r_eff,
+            r_int,
+            has,
+            charge,
         )
-        # Defensive default: seal our assigned opponent's shot cone.
-        move = threat_cover(marks, team_goal, left_post, right_post, r_int)
-        # Attacking: hold this player's own station in the shape.
+        cover_move, on_cover = cover_or_intercept(
+            urgency,
+            threat_times,
+            threat_covers,
+            threat_sealed,
+            me,
+            ball,
+            ball_vel,
+        )
+        # Free defenders (all threats sealed, or this slot has no open mark)
+        # chase the ball; otherwise hold the urgency-ranked seal.
+        intercept_free = predict_ball_meet_point(me, ball, ball_vel, SPRINT_SPEED)
+        defend = ConditionalSetVector3(on_cover, cover_move, intercept_free)
+        # Capable presser: go win the stall; seal only on a cheap detour.
+        # Incapable flanker never gets this job (stamina gate above).
+        aggro = aggressive_press_with_cover(
+            me, cover_move, on_cover, opp_carrier_body, r_int
+        )
+        defend = ConditionalSetVector3(
+            And(And(opp_has, i_am_presser), any_presser), aggro, defend
+        )
         support = ball + fwd * Float(ahead) + lat * Float(side)
-        move = ConditionalSetVector3(And(team_has, Not(has)), support, move)
+        # While WE hold: same cover clocks are live (steal→shot), not cosmetics.
+        # If any opponent can actually win the stamina duel, seal those cones;
+        # if nobody can take the ball, push into attack stations instead.
+        any_steal = Bool(False)
+        for t_steal in threat_times:
+            any_steal = Or(any_steal, CompareFloats(t_steal, Float(500.0), "<"))
+        with_ball_offball = ConditionalSetVector3(any_steal, defend, support)
+        # Lackey (P3): stay in the carrier's back pocket whenever we possess,
+        # so there is always one guaranteed safe-pass body if anti-tackle fails.
+        if slot == 3:
+            with_ball_offball = ConditionalSetVector3(team_has, lackey_pos, with_ball_offball)
+        move = ConditionalSetVector3(And(team_has, Not(has)), with_ball_offball, defend)
+        # When defending (opp has / loose threats), use cover-or-intercept —
+        # not the attacking support station.
+        move = ConditionalSetVector3(And(Not(team_has), Not(has)), defend, move)
         move = ConditionalSetVector3(has, carry, move)
 
         # Loose ball is nobody's yet. Two different situations, not one:
@@ -1084,9 +1923,23 @@ def main() -> None:
         contested = CompareFloats(nearest_opponent_dist(opponents, ball), Distance(me, ball) * Float(1.3), "<=")
         loose_target = ConditionalSetVector3(contested, meet_point_sprint, meet_point_walk)
         move = ConditionalSetVector3(And(loose, closest), loose_target, move)
-        sprint = And(loose, And(closest, contested))
+        # Sprint: contested loose, spare free defender, or stamina-capable
+        # presser closing on the opponent carrier.
+        press_sprint = And(
+            And(And(opp_has, Not(has)), Not(team_has)),
+            And(i_am_presser, any_presser),
+        )
+        sprint = Or(
+            And(loose, And(closest, contested)),
+            Or(
+                And(And(Not(on_cover), Not(has)), Not(team_has)),
+                press_sprint,
+            ),
+        )
         plot_xz(f"Titanium.P{slot}.Pos", "Cyan", me)
         plot_xz(f"Titanium.P{slot}.Target", "Yellow", move)
+        DebugDrawLine(me, move, Float(0.05), "White")
+        DebugDrawDisc(move, Float(0.2), Float(0.05), "Yellow")
         SoccerController(slot, move, sprint, player_interact(slot, has, shoot_now))
 
     # --- Player 4 goalkeeper ---
@@ -1108,24 +1961,59 @@ def main() -> None:
         loose,
         carrier_charge,
     )
-    # Loose ball: go to ball only if closest teammate; sprint already gated
-    # inside gk_policy (goal-bound-shot walk-vs-sprint check).
     closest4 = SoccerGetBool("Is Team Player 4 Closest Teammate to Ball")
     move4 = ConditionalSetVector3(And(loose, closest4), ball, move4)
+    # Re-apply champion half clamp after the loose-ball override (same as
+    # gk_policy) so chasing a far loose ball cannot yank P4 over midfield.
+    move4 = ConditionalSetVector3(h4, move4, clamp_own_half(move4, team_goal))
     plot_xz("Titanium.P4.Pos", "Cyan", p4)
     plot_xz("Titanium.P4.Target", "Yellow", move4)
+    DebugDrawLine(p4, move4, Float(0.05), "White")
+    DebugDrawDisc(move4, Float(0.2), Float(0.05), "Yellow")
     SoccerController(4, move4, sprint4, interact4)
+
+    CANDIDATE_OUT.parent.mkdir(parents=True, exist_ok=True)
+    SaveData(str(CANDIDATE_OUT), layout="grid")
+    print(f"Wrote candidate: {CANDIDATE_OUT}")
+    print(f"nodes={len(graph_data['serializableNodes'])} conns={len(graph_data['serializableConnections'])}")
+
+    # Always refresh Titanium_test for side-by-side playtesting. Never touches
+    # live Titanium.txt unless --promote is passed after the gate wins.
+    text = CANDIDATE_OUT.read_text(encoding="utf-8")
+    TEST_SAVES.parent.mkdir(parents=True, exist_ok=True)
+    TEST_LOCAL.parent.mkdir(parents=True, exist_ok=True)
+    TEST_SAVES.write_text(text, encoding="utf-8")
+    TEST_LOCAL.write_text(text, encoding="utf-8")
+    print(f"Wrote playtest: {TEST_SAVES}")
+    print(f"Wrote playtest: {TEST_LOCAL}")
+
+    if "--promote" not in sys.argv:
+        print(
+            "\nNOT deployed to live Titanium.txt — only candidate + Titanium_test.\n"
+            "Gate it first (aicomp-soccer-sim/scripts/gate_round_robin.py) "
+            "against the currently-live build, then re-run with --promote "
+            "once it's actually won."
+        )
+        return
+
+    BACKUPS_DIR.mkdir(parents=True, exist_ok=True)
+    if LOCAL_OUT.is_file():
+        prior = LOCAL_OUT.read_bytes()
+        n = 0
+        backup_path = BACKUPS_DIR / "Titanium_pre_promote.txt"
+        while backup_path.is_file() and backup_path.read_bytes() != prior:
+            n += 1
+            backup_path = BACKUPS_DIR / f"Titanium_pre_promote_{n}.txt"
+        if not backup_path.is_file():
+            backup_path.write_bytes(prior)
+        print(f"Backed up previously-live build to {backup_path}")
 
     SAVES.parent.mkdir(parents=True, exist_ok=True)
     LOCAL_OUT.parent.mkdir(parents=True, exist_ok=True)
-    SaveData(str(SAVES), layout="grid")
-    # Also write a local copy for the sim repo.
-    Path(SAVES).replace  # noqa: keep linter calm
-    text = SAVES.read_text(encoding="utf-8")
+    SAVES.write_text(text, encoding="utf-8")
     LOCAL_OUT.write_text(text, encoding="utf-8")
-    print(f"Wrote {SAVES}")
-    print(f"Wrote {LOCAL_OUT}")
-    print(f"nodes={len(graph_data['serializableNodes'])} conns={len(graph_data['serializableConnections'])}")
+    print(f"PROMOTED to live: {SAVES}")
+    print(f"PROMOTED to live: {LOCAL_OUT}")
 
 
 if __name__ == "__main__":
