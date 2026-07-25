@@ -854,14 +854,32 @@ def gk_policy(
 
 
 def main() -> None:
-    # Faceoff (team space: +X attack)
+    # Faceoff (team space: +X attack). Team space is already mirrored to
+    # whichever physical side we're on, so two legality rules apply
+    # regardless of home/away:
+    #   1. No coordinate may be positive — that's past the halfway line
+    #      into the opponent's half before kickoff even starts.
+    #   2. Only the kickoff-taker may sit inside the center circle
+    #      (r=7.25, confirmed in aicomp-soccer-sim/docs/AIA_UPSTREAM_QUIRKS.md
+    #      #13). Every other body must be far enough out that its
+    #      distance from center clears that radius.
+    #
+    # Magnitudes here are read directly out of AIA3.txt's own graph (traced
+    # ConstructSoccerProperties's 4 inputs back through its
+    # StrikerKickoffPos/DefenderKickoffPos/PlaymakerKickoffPos/
+    # GoalieKickoffPos SetVariable chain to their literal Float values:
+    # striker ~(1, 7), defender (5, 7), playmaker (11, 0), goalie (36, 0) —
+    # mirrored negative here to stay in our own half.
+    # P1 (kickoff-taker): distance 2.0 from center — inside, the one slot
+    # allowed to be. P2 distance sqrt(5^2+7^2)=8.6, P3 distance 11, P4
+    # distance 36 — all clear of the r=7.25 circle.
     InitializeSoccer(
         "Titanium",
         "Poland",
-        Vector3(Float(8), Float(0), Float(3)),
-        Vector3(Float(6), Float(0), Float(-6)),
-        Vector3(Float(6), Float(0), Float(6)),
-        Vector3(Float(-14), Float(0), Float(0)),
+        Vector3(Float(0), Float(0), Float(2)),
+        Vector3(Float(-5), Float(0), Float(7)),
+        Vector3(Float(-11), Float(0), Float(0)),
+        Vector3(Float(-36), Float(0), Float(0)),
     )
 
     ball = pos("Ball")
