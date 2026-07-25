@@ -1,0 +1,38 @@
+"""Gameplay tuning constants — geometry, speeds, and kick physics."""
+from __future__ import annotations
+
+import math
+
+BALL_RADIUS = 0.4064
+# Upright post world radius. Not exposed by any SoccerGet — hardcoded from
+# the same confirmed/measured Unity geometry the offline sim uses (posts at
+# world x=+-40.2, world radius 0.3; see aicomp-soccer-sim/docs/SOCCER_GAME_MODEL.md).
+POST_RADIUS = 0.3
+POST_CONTACT_RADIUS = POST_RADIUS + BALL_RADIUS
+ANGLE_EPS = math.radians(0.5)
+WALK_SPEED = 7.0
+SPRINT_SPEED = 8.0
+# Opponent carrier speed while running with the ball. Confirmed measurement
+# (AIA_UPSTREAM_QUIRKS.md #11: walk ~7 m/s flat, no stamina throttle) — same
+# figure as WALK_SPEED, reused directly rather than guessing a separate
+# constant. There is no "Opponent Velocity" getter, so heading comes from the
+# held ball offset instead (see `titanium.goalkeeper.carrier_heading`).
+CARRIER_SPEED = WALK_SPEED
+
+# Kick launch physics. Not exposed by any SoccerGet — hardcoded from the same
+# TimePlot-calibrated constants the offline sim uses (aicomp-soccer-sim
+# SimParams::fallback). Used only to ESTIMATE the charge that produced an
+# already-observed ball speed (and from it, an estimated airborne hang time)
+# — never to predict our own kicks, which we already control directly.
+KICK_SPEED_BASE = 10.0 / 9.0
+KICK_SPEED_PER_CHARGE = 290.0 / 9.0
+KICK_LIFT_BASE = -0.323
+KICK_LIFT_PER_CHARGE = 6.6667
+GRAVITY = 9.81
+# Warmup is already done while they hold+interact; remaining to full is
+# (1-charge)*shot_charge_time_s once charge has started climbing.
+SHOT_CHARGE_TIME_S = 0.38
+# "Fully charged" for release purposes. The engine clamps charge at exactly
+# 1.0 and holds it there, so this only needs to clear float noise.
+FULL_CHARGE = 0.99
+HOLD_PROXY = 0.55

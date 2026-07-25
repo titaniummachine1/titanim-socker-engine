@@ -1,0 +1,301 @@
+"""Goalkeeper: safe cover stand, charge-aware press, threat interception,
+and the multi-body defense that hands the same cover construction to
+outfielders (see `threat_cover`, used from `titanium.graph`)."""
+from __future__ import annotations
+
+from titanium._env import *  # noqa: F401,F403
+from titanium.ball_physics import own_goal_threat, predict_ball_meet_point
+from titanium.constants import (
+    CARRIER_SPEED,
+    FULL_CHARGE,
+    POST_AIM_RADIUS,
+    SHOT_CHARGE_TIME_S,
+    SPRINT_SPEED,
+    WALK_SPEED,
+)
+from titanium.geometry import (
+    clamp01,
+    clamp_own_half,
+    is_legal_direction,
+    opponent_half_angle,
+    opponent_invariants,
+    post_tangent,
+    pos,
+    unit_or_zero,
+)
+from titanium.shot import safe_walk_target
+from titanium.tackle import player_interact
+
+
+def gk_cover_stand(shot_origin, team_goal, left_post, right_post, interact_r, charge=None):
+    """Safe stand between `shot_origin` and goal along the post-tangent bisector.
+
+    Static geometry: d_seal = R/sin(α) is the *deepest* point that still
+    touches both extreme shot rays. Standing there is the conservative seal.
+
+    Charge-aware (held ball): opponent still needs (1−c)·0.38s to reach full
+    power. In that window we can walk `vg·t` toward the shooter, so we stand
+    at d_seal − recover (clamped above the interact bubble). They may release
+    anytime at the current charge — that only makes the ball slower, so the
+    static cone at the forward stand still covers; the recover term is what
+    keeps us able to get back onto the full-power seal before they finish.
+    """
+    to_goal = unit_or_zero(team_goal - shot_origin)
+    to_l, _ = post_tangent(shot_origin, left_post, POST_AIM_RADIUS)
+    to_r, _ = post_tangent(shot_origin, right_post, POST_AIM_RADIUS)
+    bisector = unit_or_zero(to_l + to_r)
+    cos_posts = clamp01(DotProduct(to_l, to_r))
+    sin_half = Sqrt((Float(1) - cos_posts) * Float(0.5))
+    sin_half = ConditionalSetFloat(CompareFloats(sin_half, Float(0.05), "<"), Float(0.05), sin_half)
+    d_seal = interact_r / sin_half
+    dist_goal = Distance(shot_origin, team_goal)
+    d_deep = ConditionalSetFloat(
+        CompareFloats(dist_goal - Float(2.0), Float(0.5), "<"),
+        Float(0.5),
+        dist_goal - Float(2.0),
+    )
+    # Deepest legal static seal (never past the goal-mouth cushion).
+    d_passive = ConditionalSetFloat(CompareFloats(d_seal, d_deep, "<"), d_seal, d_deep)
+    # Never stand inside the carrier's interact bubble (nutmeg / free turn).
+    d_near = interact_r * Float(1.15)
+
+    if charge is None:
+        d_forward = d_passive
+    else:
+        c = clamp01(charge)
+        t_to_full = (Float(1.0) - c) * Float(SHOT_CHARGE_TIME_S)
+        recover = Float(WALK_SPEED) * t_to_full
+        d_fwd = d_passive - recover
+        d_forward = ConditionalSetFloat(CompareFloats(d_fwd, d_near, "<"), d_near, d_fwd)
+
+    cover = shot_origin + bisector * d_forward
+    cover_home = team_goal - to_goal * Float(2.0)
+
+    def seals(stand):
+        """Stand is inside the guaranteed intercept region (static miss test)."""
+        to_g = unit_or_zero(stand - shot_origin)
+        between = CompareFloats(Distance(stand, team_goal), Distance(shot_origin, team_goal), "<=")
+        dist_sb = Magnitude(stand - shot_origin)
+        cross_l = Abs(to_g.x * to_l.z - to_g.z * to_l.x)
+        cross_r = Abs(to_g.x * to_r.z - to_g.z * to_r.x)
+        cut_l = CompareFloats(cross_l * dist_sb, interact_r, "<=")
+        cut_r = CompareFloats(cross_r * dist_sb, interact_r, "<=")
+        return And(between, And(cut_l, cut_r))
+
+    cover = ConditionalSetVector3(seals(cover), cover, cover_home)
+    cover = ConditionalSetVector3(seals(cover), cover, cover_home)
+    return cover, seals
+
+
+def threat_cover(opp_pos, team_goal, left_post, right_post, interact_r):
+    """Seal point for ONE opponent's shot cone at our goal.
+
+    This is the whole "multi-body goalkeeper" idea: the exact construction
+    the keeper uses against the ball carrier, handed to an outfield player
+    and pointed at a different opponent. Every opponent who could receive and
+    shoot gets somebody standing on the closest point that still covers both
+    extremes of *their* scoring cone, so the team collectively seals every
+    lane instead of one keeper guessing which one matters.
+    """
+    cover, _seals = gk_cover_stand(opp_pos, team_goal, left_post, right_post, interact_r)
+    return cover
+
+
+def opponent_carrier(opponents, ball):
+    """Opponent BODY position currently holding the ball, falling back to
+    the nearest opponent to the ball when no explicit holder bit is set.
+    Press/seal targets must always be a body position, never the ball's
+    held-offset point."""
+    has_bits = [SoccerGetBool(f"Opponent Player {i} Has Ball") for i in range(1, 5)]
+    carrier = opponents[-1]
+    has_any = Bool(False)
+    for opp, has in zip(opponents, has_bits):
+        carrier = ConditionalSetVector3(has, opp, carrier)
+        has_any = Or(has_any, has)
+    nearest = opponents[0]
+    nearest_d = Distance(opponents[0], ball)
+    for opp in opponents[1:]:
+        d = Distance(opp, ball)
+        nearer = CompareFloats(d, nearest_d, "<")
+        nearest = ConditionalSetVector3(nearer, opp, nearest)
+        nearest_d = ConditionalSetFloat(nearer, d, nearest_d)
+    return ConditionalSetVector3(has_any, carrier, nearest)
+
+
+@cache
+def carrier_heading(carrier, ball):
+    """Unit heading of the opponent carrying the ball.
+
+    There is no "Opponent Player N Velocity" getter, but we don't need one:
+    the engine parks a held ball at `body + facing * hold_offset`, and a
+    player's `facing` tracks their MoveTo target. So the held-ball offset
+    direction IS the carrier's heading, available from current-tick data with
+    no cross-tick memory.
+
+    (This is the same offset that made raw "Ball Velocity" useless while the
+    ball is held — a spinning carrier swings the offset around. As a
+    *direction* it is exactly what we want; as a velocity it was noise.)
+    """
+    return unit_or_zero(ball - carrier)
+
+
+@cache
+def carrier_lead(gk, carrier, ball, cover_now, charge):
+    """Where the carrier will be when their shot can actually hurt us.
+
+    Sealing the cone from where a carrier stands *right now* is what AIA
+    exploits: it runs a straight line across the mouth, the cone apex slides
+    sideways every tick, and the GK spends the whole run trailing its own
+    target by its acceleration lag — never arriving, never tackling.
+
+    The charge clock bounds how far it is safe to lead. A carrier at charge
+    `c` physically cannot release a *full-power* shot for another
+    `(1-c) * SHOT_CHARGE_TIME_S` seconds. They can of course release early,
+    but an early release is a slower ball, which we have correspondingly more
+    time to reach. So lead by whichever is smaller:
+
+      * `t_reach` — how long we need to get onto the current cover point.
+        Leading further than this is pointless; we cannot use the extra time.
+      * `t_full`  — when a full-power shot first becomes possible. Leading
+        past this would abandon a cone that is about to go live.
+
+    The clamp makes the behaviour collapse continuously: a carrier just
+    running (`c ~ 0`) is led by the full ~0.38s (~2.9m, enough to actually
+    meet them), while a carrier winding up (`c -> 1`) is led by ~0 and we
+    simply cover where they are. No discrete "press vs seal" mode switch —
+    those discontinuous jumps were what AIA exploited before.
+    """
+    heading = carrier_heading(carrier, ball)
+    t_reach = Distance(gk, cover_now) / Float(WALK_SPEED)
+    t_full = (Float(1.0) - clamp01(charge)) * Float(SHOT_CHARGE_TIME_S)
+    lead_t = ConditionalSetFloat(CompareFloats(t_reach, t_full, "<"), t_reach, t_full)
+    return carrier + heading * (Float(CARRIER_SPEED) * lead_t)
+
+
+def gk_policy(
+    gk,
+    ball,
+    ball_vel,
+    team_goal,
+    left_post,
+    right_post,
+    opponents,
+    r_eff,
+    has_ball,
+    charge,
+    opp_has,
+    loose,
+    carrier_charge,
+):
+    """GK stays inside the shot-intercept safe region.
+
+    Sprint only for a loose goal-bound ball that walk cannot reach in time.
+    Held-ball cover uses the carrier body + their current shot charge so we
+    step forward while they still have charge time left. Interact follows
+    AIA Player Interact so any nearby claimable ball is always grabbed.
+
+    Returns `(move, sprint, interact, debug)` — `debug` is a dict of the
+    intermediate values `titanium.debug_viz` draws; keeping the computation
+    here and the drawing there is the module split, not a hidden dependency.
+    """
+    interact_r = SoccerGetFloat("Player Interact Radius")
+    cover, seals = gk_cover_stand(ball, team_goal, left_post, right_post, interact_r)
+
+    # With ball: clear upfield; do not sprint for the clear walk-up.
+    #
+    # Routed through the same forbidden-cone avoidance the outfielders use
+    # (`safe_walk_target`) rather than a raw walk toward `clear_dir` — a GK
+    # who just won the ball deep in his own box is standing right next to
+    # whoever he took it from, and a blind walk toward the clear direction
+    # can carry him straight past that opponent, handing back an instant
+    # re-tackle a few metres from our own goal (confirmed via
+    # titanium_matchtrace: exactly this sequence conceded a goal at t=36.8s
+    # of an AIA3 match — GK wins the ball at x=-38, walks to clear, gets
+    # retackled by the stationary opponent one tick later, ball walked in).
+    clear_dir = SoccerGetVector3("Clear direction from Teammate 4")
+    clear_target = gk + unit_or_zero(clear_dir) * Float(14)
+    clear_target = ConditionalSetVector3(
+        IsNull(clear_dir), pos("Opponent Goal Center"), clear_target
+    )
+    clear_spot = safe_walk_target(gk, ball, clear_target, opponents, r_eff, step=14)
+    move = ConditionalSetVector3(has_ball, clear_spot, cover)
+
+    # Sprint ONLY to intercept a free ball whose predicted path crosses our
+    # own goal line — and only when walking can't already get there in time.
+    # Gated on `loose`: held-ball "Ball Velocity" is the offset point, not
+    # the carrier, and spinning opponents were fabricating fake threats.
+    goal_half_width_est = Abs(left_post.z)
+    is_threat_raw, threat_time, threat_point = own_goal_threat(
+        ball, ball_vel, team_goal.x, goal_half_width_est
+    )
+    is_threat = And(is_threat_raw, loose)
+    dist_gk_threat = Distance(gk, threat_point)
+    walk_time_threat = dist_gk_threat / Float(WALK_SPEED)
+    sprint_time_threat = dist_gk_threat / Float(SPRINT_SPEED)
+    walk_cant_make_it = CompareFloats(walk_time_threat, threat_time, ">")
+    sprint_can_make_it = CompareFloats(sprint_time_threat, threat_time, "<=")
+    sprint = And(is_threat, And(walk_cant_make_it, sprint_can_make_it))
+
+    # Opponent holds the ball: charge-aware press from the carrier BODY
+    # (never the held-ball offset — spin would yank the target around),
+    # aimed at where they will BE, not where they are. See `carrier_lead`.
+    carrier = opponent_carrier(opponents, ball)
+    press_now, _seals_now = gk_cover_stand(
+        carrier, team_goal, left_post, right_post, interact_r, charge=carrier_charge
+    )
+    carrier_pred = carrier_lead(gk, carrier, ball, press_now, carrier_charge)
+    press, _carrier_seals = gk_cover_stand(
+        carrier_pred, team_goal, left_post, right_post, interact_r, charge=carrier_charge
+    )
+    move = ConditionalSetVector3(opp_has, press, move)
+
+    # A genuine goal-bound threat overrides the opponent-press branch above —
+    # this must run LAST. Once `is_threat` is true the carrier reference is
+    # stale anyway (they no longer have the ball), so a real threat should
+    # always win regardless of what `opp_has` says this tick.
+    move = ConditionalSetVector3(is_threat, threat_point, move)
+
+    debug = {"is_threat": is_threat, "threat_point": threat_point, "opp_has": opp_has, "press": press, "move": move}
+
+    # When the ball is claimable (nearby / loose toward us), step onto it so
+    # Interact can fire — do not stay glued to a cover point and let it pass.
+    #
+    # A genuine chase (not already in interact range) targets the ball's
+    # predicted path, not its live position — chasing live position is a
+    # pure-pursuit curve that bleeds ground to any ball with real velocity.
+    # Once it's already `nearby` there's nothing left to lead, so that case
+    # keeps the raw ball position.
+    nearby = SoccerGetBool("Is Ball Nearby Team Player 4")
+    closest_gk = SoccerGetBool("Is Team Player 4 Closest Teammate to Ball")
+    meet_point_gk = predict_ball_meet_point(gk, ball, ball_vel, WALK_SPEED)
+    chase_target_gk = ConditionalSetVector3(nearby, ball, meet_point_gk)
+    go_to_ball = Or(And(loose, closest_gk), And(nearby, Not(has_ball)))
+    chase_ok = Or(nearby, seals(gk))
+    move = ConditionalSetVector3(And(go_to_ball, chase_ok), chase_target_gk, move)
+    move = ConditionalSetVector3(And(nearby, Not(has_ball)), ball, move)
+
+    # The keeper never crosses midfield, however tempting the press or a
+    # loose ball upfield looks — being beaten past the halfway line leaves an
+    # open net behind him, and the outfield cover players exist to handle
+    # anything out there.
+    #
+    # Deliberately NOT applied while carrying: the kick fires along MoveTo, so
+    # clamping x would rotate the clear aim back toward our own goal.
+    move = ConditionalSetVector3(has_ball, move, clamp_own_half(move, team_goal))
+
+    # Same permanent-full-charge policy as everyone else: hold the ball on a
+    # maxed shot and only let go once the clear lane is actually open, rather
+    # than punting it into the nearest opponent at a fixed charge threshold.
+    clear_aim = unit_or_zero(
+        ConditionalSetVector3(IsNull(clear_dir), pos("Opponent Goal Center") - gk, clear_dir)
+    )
+    # Same shot-origin correction as build_carrier_move: the kick fires from
+    # the GK's own center, not the ball's visually-offset held position.
+    clear_invariants = [
+        opponent_invariants(o, gk, r_eff, opponent_half_angle(o, gk, r_eff))
+        for o in opponents
+    ]
+    gk_ready = CompareFloats(charge, Float(FULL_CHARGE), ">=")
+    gk_shoot = And(has_ball, And(is_legal_direction(clear_aim, clear_invariants), gk_ready))
+    interact = player_interact(4, has_ball, gk_shoot)
+    return move, sprint, interact, debug
