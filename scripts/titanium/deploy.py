@@ -378,29 +378,22 @@ def assert_variables_intact() -> None:
 
 
 def write_candidate() -> None:
+    """Build the candidate. All optimisation now lives in
+    AIGamePyLibrary.SaveData(optimize=...), so every graph built with the
+    library benefits, not just Titanium.
+
+      debug   -> prune dead nodes + unread variables, keep all drawing
+      release -> additionally CSE and strip every Debug*/TimePlot sink
+    """
     CANDIDATE_OUT.parent.mkdir(parents=True, exist_ok=True)
     before = len(graph_data["serializableNodes"])
-    stripped = strip_debug_sinks() if STRIP_DEBUG else 0
-    dropped, dangling = optimise_to_fixpoint()
-    # SaveData prunes unreachable nodes itself (pruneUnusedNodes defaults True);
-    # dropping the unread writes first is what lets it reach their producers.
-    merged = deduplicate_nodes() if DEDUPE else 0
-    if merged:
-        print(f"optimiser: merged {merged} duplicate computation(s) (CSE)")
+    mode = "release" if STRIP_DEBUG else "debug"
     if EXPLAIN:
         report_distance_from_control()
-    assert_variables_intact()
-    SaveData(str(CANDIDATE_OUT), layout="grid")
-    assert_variables_intact()   # again: SaveData prunes too
-    if stripped:
-        print(f"optimiser: stripped {stripped} debug/TimePlot sink(s) "
-              f"(competition build -- no on-screen debug)")
-    if dangling:
-        print(f"optimiser: dropped {dangling} GetVariable(s) reading into nothing")
-    if dropped or stripped or dangling:
-        after = len(graph_data["serializableNodes"])
-        print(f"optimiser: dropped {dropped} unread SetVariable(s), "
-              f"{before} -> {after} nodes")
+    SaveData(str(CANDIDATE_OUT), layout="grid", optimize=mode, verbose=True)
+    after = len(graph_data["serializableNodes"])
+    if after != before:
+        print(f"optimiser[{mode}]: {before} -> {after} nodes")
     print(f"Wrote candidate: {CANDIDATE_OUT}")
     print(f"nodes={len(graph_data['serializableNodes'])} conns={len(graph_data['serializableConnections'])}")
 
