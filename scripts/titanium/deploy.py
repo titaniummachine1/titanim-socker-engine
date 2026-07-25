@@ -242,6 +242,12 @@ def report_distance_from_control(max_depth: int = 6) -> None:
 _EFFECTFUL = {
     "SetVariable", "GetVariable", "DebugDrawLine", "DebugDrawDisc", "TimePlot",
     "Debug", "Stat", "CreateFunction", "Function", "ConstructSoccerProperties",
+    # String/Color are label inputs to sinks, not values. AIGamePyLibrary's own
+    # pruner special-cases String (nodeIsString) and never removes it, so
+    # merging them desynchronises that handling and silently killed ALL
+    # TimePlot output -- which parity_check did not catch, because it only
+    # diffs controller outputs, not draws.
+    "String", "Color",
 }
 
 

@@ -219,7 +219,6 @@ def draw_ball_path_and_threats(ball, ball_vel, loose, team4, opponents, opp_goal
         owner_t = ConditionalSetFloat(better, t, owner_t)
         owner_pos = ConditionalSetVector3(better, pl, owner_pos)
         owner_is_team = ConditionalSetBool(better, Bool(False), owner_is_team)
-
     tree_active = loose  # only meaningful once there's a real predicted receiver
     we_receive = And(tree_active, owner_is_team)
     they_receive = And(tree_active, Not(owner_is_team))
