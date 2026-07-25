@@ -27,4 +27,11 @@ from AIGamePyLibrary import *  # noqa: E402,F401,F403
 from AIGamePyLibrary.lib import data as graph_data  # noqa: E402,F401
 import ball_trajectory_graph as traj  # noqa: E402,F401  side effect: installs Node +/-/* operators
 
+# Titanium uses traj's small scalar helpers (StopDistance, TimeForDistance,
+# SpeedAtDistance, AxisDistance -- 36 nodes) and its `_event_leg` physics, but
+# never reads TrajectorySolve's outputs. Building it anyway cost 405 nodes and
+# 29 SetVariable writes that nothing ever read: measured 5004 -> 4599 nodes and
+# 11.78 -> 10.77 MB, with match results unchanged (Poponeta 16:4 either way).
+traj.BUILD_TRAJECTORY_SOLVE = False
+
 ROOT = _ENGINE_ROOT
