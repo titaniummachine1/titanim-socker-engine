@@ -79,6 +79,31 @@ def strip_debug_sinks() -> int:
     return len(doomed)
 
 
+def assert_variables_intact() -> None:
+    """Every GetVariable must still have a SetVariable writing its name.
+
+    A variable pair is a data edge with NO wire between the two nodes, so the
+    library's pruner cannot see it -- it keeps or drops each node purely on
+    whether its own ports are connected. That makes variables the one thing an
+    optimiser can silently sever: delete the write and the read still looks
+    perfectly connected while now reading nothing.
+
+    Both passes here are meant to be safe (writes are only dropped when no
+    read exists; only Debug/TimePlot sinks are stripped), but "meant to be" is
+    not a guarantee. This turns it into an enforced invariant that fails the
+    build instead of shipping a graph whose variables have been cut.
+    """
+    nodes = graph_data["serializableNodes"]
+    written = {n["modifier"] for n in nodes if n["id"] == "SetVariable"}
+    read = {n["modifier"] for n in nodes if n["id"] == "GetVariable"}
+    orphaned = read - written
+    if orphaned:
+        raise SystemExit(
+            "OPTIMISER BUG: GetVariable with no SetVariable feeding it: "
+            + ", ".join(sorted(orphaned))
+        )
+
+
 def write_candidate() -> None:
     CANDIDATE_OUT.parent.mkdir(parents=True, exist_ok=True)
     before = len(graph_data["serializableNodes"])
@@ -86,7 +111,9 @@ def write_candidate() -> None:
     dropped = drop_unread_variables()
     # SaveData prunes unreachable nodes itself (pruneUnusedNodes defaults True);
     # dropping the unread writes first is what lets it reach their producers.
+    assert_variables_intact()
     SaveData(str(CANDIDATE_OUT), layout="grid")
+    assert_variables_intact()   # again: SaveData prunes too
     if stripped:
         print(f"optimiser: stripped {stripped} debug/TimePlot sink(s) "
               f"(competition build -- no on-screen debug)")
