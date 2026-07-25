@@ -7,6 +7,8 @@ import sys
 
 from titanium._env import graph_data
 from AIGamePyLibrary import SaveData
+STRIP_DEBUG = "--strip-debug" in sys.argv
+
 from titanium.paths import BACKUPS_DIR, CANDIDATE_OUT, LOCAL_OUT, SAVES, SAVES_TEST
 
 
@@ -46,14 +48,49 @@ def drop_unread_variables() -> int:
     return len(doomed)
 
 
+def strip_debug_sinks() -> int:
+    """Delete DebugDraw/TimePlot sinks, so the pruner can collect everything
+    that existed only to feed them.
+
+    29% of the graph (1340 of 4599 nodes) is reachable ONLY from debug sinks
+    and contributes nothing to a SoccerController. Tournaments do not render
+    debug lines, so in a competition build that is pure weight -- and the
+    save format costs ~2.4 KB per node, which is what pushed the file over
+    the 10 MB limit.
+
+    Safe by construction: `titanium.debug_viz` only ever calls Debug*/TimePlot
+    and never feeds a movement decision, so removing these cannot change play.
+    Verify that claim with a gate run anyway, never on the docstring alone.
+    """
+    nodes = graph_data["serializableNodes"]
+    sinks = {"DebugDrawLine", "DebugDrawDisc", "TimePlot", "Debug"}
+    doomed = {n["sID"] for n in nodes if n["id"] in sinks}
+    if not doomed:
+        return 0
+    dead_ports = {
+        p["sID"] for n in nodes if n["sID"] in doomed
+        for p in n.get("serializablePorts", [])
+    }
+    graph_data["serializableConnections"] = [
+        c for c in graph_data["serializableConnections"]
+        if c["port0SID"] not in dead_ports and c["port1SID"] not in dead_ports
+    ]
+    graph_data["serializableNodes"] = [n for n in nodes if n["sID"] not in doomed]
+    return len(doomed)
+
+
 def write_candidate() -> None:
     CANDIDATE_OUT.parent.mkdir(parents=True, exist_ok=True)
     before = len(graph_data["serializableNodes"])
+    stripped = strip_debug_sinks() if STRIP_DEBUG else 0
     dropped = drop_unread_variables()
     # SaveData prunes unreachable nodes itself (pruneUnusedNodes defaults True);
     # dropping the unread writes first is what lets it reach their producers.
     SaveData(str(CANDIDATE_OUT), layout="grid")
-    if dropped:
+    if stripped:
+        print(f"optimiser: stripped {stripped} debug/TimePlot sink(s) "
+              f"(competition build -- no on-screen debug)")
+    if dropped or stripped:
         after = len(graph_data["serializableNodes"])
         print(f"optimiser: dropped {dropped} unread SetVariable(s), "
               f"{before} -> {after} nodes")
