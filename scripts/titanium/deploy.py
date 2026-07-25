@@ -79,6 +79,47 @@ def strip_debug_sinks() -> int:
     return len(doomed)
 
 
+def drop_dangling_reads() -> int:
+    """Delete GetVariable nodes whose output feeds nothing.
+
+    Stripping a debug sink can orphan a GetVariable that only ever fed it.
+    The orphan still makes its SetVariable look read, so the write and its
+    whole producing subgraph survive -- which is why the passes must run to a
+    fixpoint rather than once each.
+    """
+    nodes = graph_data["serializableNodes"]
+    wired = set()
+    for c in graph_data["serializableConnections"]:
+        wired.add(c["port0SID"])
+        wired.add(c["port1SID"])
+    doomed = {
+        n["sID"] for n in nodes if n["id"] == "GetVariable"
+        and not any(p["sID"] in wired for p in n.get("serializablePorts", []))
+    }
+    if not doomed:
+        return 0
+    graph_data["serializableNodes"] = [n for n in nodes if n["sID"] not in doomed]
+    return len(doomed)
+
+
+def optimise_to_fixpoint() -> tuple[int, int]:
+    """Alternate the variable passes until neither finds anything.
+
+    One pass each is not enough: dropping a write can orphan a read, and
+    dropping a read can orphan a write. Loop until stable (bounded, because
+    every iteration strictly removes nodes).
+    """
+    writes = reads = 0
+    for _ in range(10):
+        w = drop_unread_variables()
+        r = drop_dangling_reads()
+        writes += w
+        reads += r
+        if not (w or r):
+            break
+    return writes, reads
+
+
 def assert_variables_intact() -> None:
     """Every GetVariable must still have a SetVariable writing its name.
 
@@ -108,7 +149,7 @@ def write_candidate() -> None:
     CANDIDATE_OUT.parent.mkdir(parents=True, exist_ok=True)
     before = len(graph_data["serializableNodes"])
     stripped = strip_debug_sinks() if STRIP_DEBUG else 0
-    dropped = drop_unread_variables()
+    dropped, dangling = optimise_to_fixpoint()
     # SaveData prunes unreachable nodes itself (pruneUnusedNodes defaults True);
     # dropping the unread writes first is what lets it reach their producers.
     assert_variables_intact()
@@ -117,7 +158,9 @@ def write_candidate() -> None:
     if stripped:
         print(f"optimiser: stripped {stripped} debug/TimePlot sink(s) "
               f"(competition build -- no on-screen debug)")
-    if dropped or stripped:
+    if dangling:
+        print(f"optimiser: dropped {dangling} GetVariable(s) reading into nothing")
+    if dropped or stripped or dangling:
         after = len(graph_data["serializableNodes"])
         print(f"optimiser: dropped {dropped} unread SetVariable(s), "
               f"{before} -> {after} nodes")
