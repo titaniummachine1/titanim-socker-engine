@@ -10,9 +10,53 @@ from AIGamePyLibrary import SaveData
 from titanium.paths import BACKUPS_DIR, CANDIDATE_OUT, LOCAL_OUT, SAVES, SAVES_TEST
 
 
+def drop_unread_variables() -> int:
+    """Delete SetVariable nodes whose value no GetVariable ever reads.
+
+    AIGamePyLibrary's own `removeUnusedNodes` cannot do this: a SetVariable is
+    a SINK, so it always looks "used" and everything feeding it is kept alive
+    with it. That is how Titanium ended up carrying the entire 405-node
+    TrajectorySolve service -- 29 of its 31 SetVariables were written and
+    never read, and the whole computation behind them came along.
+
+    Removing the writes turns that computation into genuine dead nodes, which
+    the library's pruner then collects. Run this BEFORE SaveData.
+
+    Returns how many writes were dropped, so a build that suddenly starts
+    dropping more is visible rather than silent.
+    """
+    nodes = graph_data["serializableNodes"]
+    read = {n["modifier"] for n in nodes if n["id"] == "GetVariable"}
+    doomed = {
+        n["sID"] for n in nodes
+        if n["id"] == "SetVariable" and n["modifier"] not in read
+    }
+    if not doomed:
+        return 0
+
+    dead_ports = {
+        p["sID"] for n in nodes if n["sID"] in doomed
+        for p in n.get("serializablePorts", [])
+    }
+    graph_data["serializableConnections"] = [
+        c for c in graph_data["serializableConnections"]
+        if c["port0SID"] not in dead_ports and c["port1SID"] not in dead_ports
+    ]
+    graph_data["serializableNodes"] = [n for n in nodes if n["sID"] not in doomed]
+    return len(doomed)
+
+
 def write_candidate() -> None:
     CANDIDATE_OUT.parent.mkdir(parents=True, exist_ok=True)
+    before = len(graph_data["serializableNodes"])
+    dropped = drop_unread_variables()
+    # SaveData prunes unreachable nodes itself (pruneUnusedNodes defaults True);
+    # dropping the unread writes first is what lets it reach their producers.
     SaveData(str(CANDIDATE_OUT), layout="grid")
+    if dropped:
+        after = len(graph_data["serializableNodes"])
+        print(f"optimiser: dropped {dropped} unread SetVariable(s), "
+              f"{before} -> {after} nodes")
     print(f"Wrote candidate: {CANDIDATE_OUT}")
     print(f"nodes={len(graph_data['serializableNodes'])} conns={len(graph_data['serializableConnections'])}")
 
