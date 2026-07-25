@@ -6,3 +6,7 @@
 *.pdb
 __pycache__/
 *.pyc
+
+# stray editor/backup copies
+*.bak
+*.py.bak
