@@ -52,7 +52,9 @@ def build_carrier_move(
         positioning.opponent_in_pass_danger(me, opponents, r_int, my_stam),
     )
     mates = list(teammates)
-    can_pass, pass_dir, _pass_mate = best_escape_pass(me, mates, opponents, r_eff)
+    can_pass, pass_dir, _pass_mate = best_escape_pass(
+        me, mates, opponents, r_eff, direction_ok=aimable
+    )
 
     if WITH_ANTI_TACKLE:
         walk, at_debug = anti_tackle.carrier_walk_target(

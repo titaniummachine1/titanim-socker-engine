@@ -81,28 +81,41 @@ def nearest_opponent_dist(opponents, ball):
     return nearest_d
 
 
-def clear_pass(origin, mate, opponents, r_eff):
+def clear_pass(origin, mate, opponents, r_eff, direction_ok=None):
     """True if a straight pass origin→mate clears every opponent cone.
 
     Includes low-stam defenders — they can still intercept a loose pass.
     Anti-tackle may ghost low-stam bodies; passing must not.
+
+    `direction_ok` short-circuits the whole question. A pass is a kick, and a
+    kick fires along MoveTo, so the carrier must first TURN to face the
+    receiver — which parks the held ball on that heading. If a defender already
+    owns that angle the ball is gone before the pass exists, so the lane counts
+    as intercepted immediately and none of the cone geometry below can rescue
+    it. `titanium.anti_tackle.aim_is_safe` supplies that test.
     """
     direction = unit_or_zero(mate - origin)
     invariants = [
         opponent_invariants(o, origin, r_eff, opponent_half_angle(o, origin, r_eff))
         for o in opponents
     ]
-    return is_legal_direction(direction, invariants)
+    legal = is_legal_direction(direction, invariants)
+    return legal if direction_ok is None else And(legal, direction_ok(direction))
 
 
-def best_escape_pass(me, mates, opponents, r_eff):
-    """Nearest teammate with a clear pass lane. Returns (can_pass, aim_dir, mate_pos)."""
+def best_escape_pass(me, mates, opponents, r_eff, direction_ok=None):
+    """Nearest teammate with a clear pass lane. Returns (can_pass, aim_dir, mate_pos).
+
+    `direction_ok` is passed straight through to `clear_pass`, so a receiver
+    sitting on an angle a defender owns is rejected outright rather than being
+    picked and then lost on the turn.
+    """
     best_mate = mates[0]
     best_dir = unit_or_zero(mates[0] - me)
     best_d = Float(1e9)
     any_ok = Bool(False)
     for mate in mates:
-        ok = clear_pass(me, mate, opponents, r_eff)
+        ok = clear_pass(me, mate, opponents, r_eff, direction_ok)
         d = Distance(me, mate)
         better = And(ok, Or(Not(any_ok), CompareFloats(d, best_d, "<")))
         best_mate = ConditionalSetVector3(better, mate, best_mate)
@@ -112,9 +125,9 @@ def best_escape_pass(me, mates, opponents, r_eff):
     return any_ok, best_dir, best_mate
 
 
-def best_pass(origin, mates, opponents, r_eff):
+def best_pass(origin, mates, opponents, r_eff, direction_ok=None):
     """Nearest teammate with a clear pass lane. Returns (can_pass, aim_dir, mate_pos)."""
-    return best_escape_pass(origin, mates, opponents, r_eff)
+    return best_escape_pass(origin, mates, opponents, r_eff, direction_ok)
 
 
 def unopposed_walk_in(origin, left_post, right_post, defenders):

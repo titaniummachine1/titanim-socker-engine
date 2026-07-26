@@ -16,8 +16,13 @@ def _neg(v):
     return Vector3(Float(0) - v.x, v.y, Float(0) - v.z)
 
 
-def station_on_heading(carrier, heading, opponents, r_eff, min_dist):
-    """Farthest point along `heading` with a clear pass from carrier (≥ min_dist)."""
+def station_on_heading(carrier, heading, opponents, r_eff, min_dist, direction_ok=None):
+    """Farthest point along `heading` with a clear pass from carrier (>= min_dist).
+
+    `direction_ok` rejects headings a defender already owns: a helper standing
+    on an angle the carrier cannot even turn to face is not an outlet, because
+    the ball is lost the moment the carrier points that way.
+    """
     # `clear_pass` tests a DIRECTION cone anchored at `carrier`, and every point
     # on this ray normalises to the same direction — so legality is identical at
     # every distance. The old loop ran the cone solve once per entry in
@@ -30,7 +35,7 @@ def station_on_heading(carrier, heading, opponents, r_eff, min_dist):
     # real change to the model, and would have to clear the gate on its own.
     h = unit_or_zero(heading)
     far = Float(max(SUPPORT_OUTLET_DISTS))
-    ok = clear_pass(carrier, carrier + h, opponents, r_eff)
+    ok = clear_pass(carrier, carrier + h, opponents, r_eff, direction_ok)
     best = ConditionalSetVector3(ok, carrier + h * far, carrier + h * min_dist)
     return best, ok
 
@@ -61,13 +66,14 @@ def at_safe_flank_stations(
     lat = Vector3(Float(0) - desired.z, Float(0), desired.x)
     min_dist = r_int * Float(TEAMMATE_MIN_SEP_FRAC)
 
+    aimable = anti_tackle.aim_is_safe(carrier, opponents, r_int, my_stam)
     left_fb, _ = station_on_heading(
-        carrier, unit_or_zero(desired + lat), opponents, r_eff, min_dist
+        carrier, unit_or_zero(desired + lat), opponents, r_eff, min_dist, aimable
     )
     right_fb, _ = station_on_heading(
-        carrier, unit_or_zero(desired + _neg(lat)), opponents, r_eff, min_dist
+        carrier, unit_or_zero(desired + _neg(lat)), opponents, r_eff, min_dist, aimable
     )
-    trail_fb, _ = station_on_heading(carrier, _neg(desired), opponents, r_eff, min_dist)
+    trail_fb, _ = station_on_heading(carrier, _neg(desired), opponents, r_eff, min_dist, aimable)
 
     _dir, debug = anti_tackle.search_safe_direction(
         carrier, opp_goal, ball, opponents, r_int, team_goal, my_stam, danger
@@ -81,7 +87,7 @@ def at_safe_flank_stations(
     best_trail = Float(-1e9)
 
     for safe, usable, heading, _abs_off, _t, _w, _ev, _prog in debug["probes"]:
-        st, clear_ok = station_on_heading(carrier, heading, opponents, r_eff, min_dist)
+        st, clear_ok = station_on_heading(carrier, heading, opponents, r_eff, min_dist, aimable)
         side = DotProduct(lat, heading)
         fwd = DotProduct(desired, heading)
         # Prefer forward-usable AT dirs, then any AT-safe dir.

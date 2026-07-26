@@ -21,6 +21,10 @@ _PROBE_OFFSETS = (
     Float(-math.pi / 4),
     Float(math.pi / 4),
 )
+# Safety margin added to EACH side of a blocked arc, in radians. One degree:
+# enough to swallow float noise on the boundary without meaningfully narrowing
+# the angles actually available.
+ARC_MARGIN = math.radians(1.0)
 _UNSAFE_EVAL = Float(-1000)
 _SCORE_EVAL = Float(1e6)
 _WALK = Float(WALK_SPEED)
@@ -147,6 +151,24 @@ def hold_block_arc(me, opp, r_int, my_stam, opp_stam, hold=HOLD_OFFSET):
         Float(0) - Float(1),
         Float(1),
     )
+    # Widen the blocked arc by ARC_MARGIN on EACH side, so an aim that only just
+    # clears a defender is treated as blocked. A candidate landing exactly on the
+    # boundary is otherwise decided by float error, and the cost of being wrong
+    # is asymmetric: aim slightly too tight and the ball is gone, aim slightly
+    # too wide and you give up a sliver of angle.
+    #
+    # Done with the cosine addition identity rather than acos/cos:
+    #     cos(a + m) = cos a * cos m - sin a * sin m,  sin a = sqrt(1 - cos^2 a)
+    # `cos m` and `sin m` are compile-time constants, so widening costs four
+    # nodes and still never evaluates a trig function at runtime. A wider arc is
+    # a SMALLER cosine, which is why this subtracts.
+    sin_half = Sqrt(ClampFloat(Float(1) - MultiplyFloats(cos_half, cos_half), Float(0), Float(1)))
+    cos_half = ClampFloat(
+        MultiplyFloats(cos_half, Float(math.cos(ARC_MARGIN)))
+        - MultiplyFloats(sin_half, Float(math.sin(ARC_MARGIN))),
+        Float(0) - Float(1),
+        Float(1),
+    )
     return toward, cos_half, blocks_everything, blocks_nothing
 
 
@@ -161,6 +183,104 @@ def hold_direction_blocked(direction, arc):
     toward, cos_half, blocks_everything, blocks_nothing = arc
     inside = CompareFloats(DotProduct(direction, toward), cos_half, ">=")
     return And(Not(blocks_nothing), Or(blocks_everything, inside))
+
+
+@cache
+def arc_edges(arc):
+    """The two boundary directions of a blocked arc — its exact min and max
+    tackleable angle — WITHOUT ever computing the angle.
+
+    `hold_block_arc` already produced `cos_half`, and `sin_half` is
+    `sqrt(1 - cos^2)`, so rotating `toward` by +-half is just the rotation
+    matrix with those two values substituted in. No `acos`, no `cos`, no `sin`
+    at runtime:
+
+        edge+ = ( x*cos - z*sin,  0,  x*sin + z*cos )
+        edge- = ( x*cos + z*sin,  0, -x*sin + z*cos )
+
+    These are the candidate headings worth trying when the straight line to goal
+    is blocked: the closest you can aim to your intended direction while still
+    grazing past this defender.
+    """
+    toward, cos_half, _blocks_everything, _blocks_nothing = arc
+    parts = Vector3Split(toward)
+    x, z = parts.x, parts.z
+    sin_half = Sqrt(ClampFloat(Float(1) - MultiplyFloats(cos_half, cos_half), Float(0), Float(1)))
+    xc, xs = MultiplyFloats(x, cos_half), MultiplyFloats(x, sin_half)
+    zc, zs = MultiplyFloats(z, cos_half), MultiplyFloats(z, sin_half)
+    left = Vector3(xc - zs, Float(0), xs + zc)
+    right = Vector3(xc + zs, Float(0), zc - xs)
+    return unit_or_zero(left), unit_or_zero(right)
+
+
+def blocked_arcs(me, opponents, r_int, my_stam, hold=HOLD_OFFSET):
+    """Every blocked arc, hoisted once for all candidate directions.
+
+    TWO arcs per opponent, not one. The engine's tackle test is
+
+        min(tackler_hold_to_ball, tackler_body_to_ball) <= interact_radius
+
+    so a tackler reaches from their HOLD POINT as well as their body, and the
+    hold point sits `hold` (1.67 m) ahead of them along their facing. Their real
+    reach is therefore up to interact_radius + hold in the direction they face -
+    nearly DOUBLE the 1.75 m body radius this model used to assume.
+
+    That single omission is the defect, measured rather than guessed: against
+    Poponeta over 180 s, 19 balls were lost to tackles, ZERO of them
+    unavoidable, and ~90% were headings this model had judged safe. It was not
+    unlucky, it was reading the wrong reach.
+
+    A tackler's facing is not exposed by any getter, but the engine parks a held
+    ball at `body + facing * hold`, so for a carrier the offset direction IS the
+    facing. A defender without the ball has no such tell, so their facing is
+    approximated as pointing at us - the direction that matters, since a
+    defender facing away cannot reach us with their hold point anyway.
+    """
+    staminas = opponent_staminas()
+    arcs = []
+    for opp, stam in zip(opponents, staminas):
+        # Body reach.
+        arcs.append(hold_block_arc(me, opp, r_int, my_stam, stam, hold))
+        # Hold-point reach: the same solve, from a point `hold` nearer to us.
+        toward_us = unit_or_zero(me - opp)
+        opp_hold = opp + toward_us * Float(hold)
+        arcs.append(hold_block_arc(me, opp_hold, r_int, my_stam, stam, hold))
+    return arcs
+
+
+def best_open_direction(desired_dir, arcs):
+    """Direction closest to `desired_dir` that no arc blocks.
+
+    Walk as straight at the goal as the defence allows: try the direct line
+    first, and if a defender owns it, fall back to the nearest angle that just
+    clears somebody — which is exactly an arc edge. Scoring is the dot product
+    with the desired direction, so "best" means "least deviation from straight
+    at goal", and the winner is the tightest legal line rather than the best of
+    five fixed offsets.
+
+    Returns `(direction, any_open)`. `any_open` false means every candidate is
+    covered: there is nowhere to walk without being tackled, so the caller
+    should pass instead of retreating.
+    """
+    candidates = [desired_dir]
+    for arc in arcs:
+        left, right = arc_edges(arc)
+        candidates.extend((left, right))
+
+    best = desired_dir
+    best_score = _UNSAFE_EVAL
+    any_open = Bool(False)
+    for cand in candidates:
+        blocked = Bool(False)
+        for arc in arcs:
+            blocked = Or(blocked, hold_direction_blocked(cand, arc))
+        open_ = Not(blocked)
+        score = DotProduct(cand, desired_dir)
+        better = And(open_, Or(Not(any_open), CompareFloats(score, best_score, ">")))
+        best = ConditionalSetVector3(better, cand, best)
+        best_score = ConditionalSetFloat(better, score, best_score)
+        any_open = Or(any_open, open_)
+    return best, any_open
 
 
 def aim_is_safe(me, opponents, r_int, my_stam, hold=HOLD_OFFSET):
@@ -287,6 +407,23 @@ def search_safe_direction(
     staminas = opponent_staminas()
     opp_goal = desired
 
+    # Closed-form pick: walk as straight at goal as the defence allows.
+    # Candidates are the direct line plus every arc edge, scored by how little
+    # they deviate from it. This replaces choosing among five fixed offsets,
+    # each of which cost a full end-of-tick simulation to evaluate; an arc edge
+    # is the EXACT tightest line past a defender, not the nearest of 5 samples.
+    arcs = blocked_arcs(me, opponents, r_int, my_stam, hold)
+    open_dir, any_open = best_open_direction(desired_dir, arcs)
+
+    # Headings offered to `support_outlets`. Deliberately the five fixed offsets
+    # rather than every arc edge: the arcs decide where the CARRIER walks, but
+    # supports only need a spread of directions to stand on, and one station is
+    # built per heading — nine candidates cost more in stations than they buy in
+    # coverage (measured: 5476 -> 5646 nodes for no behavioural gain).
+    #
+    # Only `safe`, `usable` and `heading` survive DCE here; the eval and
+    # clearance machinery each probe used to compute is dead once the arcs pick
+    # the direction, so the simulation cost goes with it.
     probes = [
         _probe(
             me,
@@ -306,36 +443,25 @@ def search_safe_direction(
         for off in _PROBE_OFFSETS
     ]
 
-    best_dir = desired_dir
-    best_eval = _UNSAFE_EVAL
+    # The arcs decide WHERE to walk. The probes are still built because
+    # `support_outlets` reads their per-heading safety and `debug_viz` plots
+    # them, but they no longer select the direction.
+    any_safe = any_open
+    any_usable = any_open
+    best_dir = open_dir
+    best_eval = DotProduct(open_dir, desired_dir)
     best_offset = Float(0)
-    any_usable = Bool(False)
-    any_safe = Bool(False)
 
-    for off, (safe, usable, direction, abs_off, _tackleable, _worst, eval_score, _prog) in zip(
-        _PROBE_OFFSETS, probes
-    ):
-        any_safe = Or(any_safe, safe)
-        better = And(usable, Or(Not(any_usable), CompareFloats(eval_score, best_eval, ">")))
-        best_dir = ConditionalSetVector3(better, direction, best_dir)
-        best_eval = ConditionalSetFloat(better, eval_score, best_eval)
-        best_offset = ConditionalSetFloat(better, off, best_offset)
-        any_usable = Or(any_usable, usable)
-
+    # Own-goal guard still needs the actual end-of-tick ball position: the arcs
+    # answer "can I keep the ball", not "does keeping it put it in my own net".
     _me_end, ball_end = simulate_end_of_tick(me, best_dir, move_step, hold)
-    predicted_tackleable, _ = _end_tick_tackleable(
-        ball_end, ball_start, opponents, opponent_staminas(), r_int, me, my_stam
-    )
     enemy_net = positioning.ball_in_goal_net(ball_end, opp_goal)
     own_net = positioning.ball_in_goal_net(ball_end, team_goal)
     own_goal_ok = And(
         positioning.ball_clear_of_own_goal_plane(ball_end, team_goal),
         Not(own_net),
     )
-    predicted_safe = Or(
-        enemy_net,
-        And(Not(And(predicted_tackleable, Not(enemy_net))), own_goal_ok),
-    )
+    predicted_safe = Or(enemy_net, And(any_open, own_goal_ok))
     # No forward-safe walk (only back / none) → pass, never walk backward.
     # Exception: enemy-net finish is usable even if classified oddly.
     need_pass = Not(any_usable)
