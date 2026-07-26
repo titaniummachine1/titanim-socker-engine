@@ -9,6 +9,7 @@ ball_trajectory_graph has the side effect of installing the Node
 from __future__ import annotations
 
 import sys
+import sys
 from functools import cache
 from pathlib import Path
 
@@ -33,5 +34,9 @@ import ball_trajectory_graph as traj  # noqa: E402,F401  side effect: installs N
 # 29 SetVariable writes that nothing ever read: measured 5004 -> 4599 nodes and
 # 11.78 -> 10.77 MB, with match results unchanged (Poponeta 16:4 either way).
 traj.BUILD_TRAJECTORY_SOLVE = False
+
+# `--with-anti-tackle` / `--challenger`: build the binary-search rotation module
+# as a separate candidate; default main build walks straight (no dodge).
+WITH_ANTI_TACKLE = "--with-anti-tackle" in sys.argv or "--challenger" in sys.argv
 
 ROOT = _ENGINE_ROOT

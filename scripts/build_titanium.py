@@ -21,11 +21,32 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from titanium import deploy, graph  # noqa: E402
+from titanium import profile as _profile  # noqa: E402
 
 
 def main() -> None:
+    # --profile must wrap the node constructor BEFORE anything is built.
+    profiling = "--profile" in sys.argv
+    if profiling:
+        _profile.install()
+
     graph.build()
-    deploy.write_candidate()
+
+    if profiling:
+        from titanium._env import graph_data
+
+        # Report the graph the build actually writes, i.e. after SaveData's
+        # optimiser has run — profiling the pre-optimise graph would blame
+        # modules for nodes that never ship.
+        deploy.write_candidate()
+        _profile.report(
+            graph_data["serializableNodes"],
+            graph_data["serializableConnections"],
+            write_baseline="--baseline" in sys.argv,
+        )
+    else:
+        deploy.write_candidate()
+
     deploy.promote_if_requested()
 
 

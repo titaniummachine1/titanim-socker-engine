@@ -19,6 +19,7 @@ from titanium.constants import (
     KICK_SPEED_PER_CHARGE,
 )
 from titanium.geometry import clamp01, unit_or_zero
+from titanium.nodefn import graph_function
 
 _EVENT_LEG_CHAIN_BUILT = False
 
@@ -296,12 +297,11 @@ def simulate_kick_breakpoints(origin, aim_dir, charge, live_y):
 
 
 def _clamp_axis(v, lo, hi):
-    v = ConditionalSetFloat(CompareFloats(v, Float(hi), ">"), Float(hi), v)
-    return ConditionalSetFloat(CompareFloats(v, Float(lo), "<"), Float(lo), v)
+    return ClampFloat(v, Float(lo), Float(hi))
 
 
-@cache
-def predict_ball_meet_point(me, ball, ball_vel, speed):
+@graph_function("TiMeetPoint", ("Vector3", "Vector3", "Vector3", "Float"), "Vector3")
+def _meet_point(me, ball, ball_vel, speed):
     """Where to walk to meet a moving ball, instead of its live position.
 
     Fixed-point pursuit solve (3 refinements): guess a travel time from the
@@ -334,7 +334,7 @@ def predict_ball_meet_point(me, ball, ball_vel, speed):
 
     point = ball
     for _ in range(3):
-        t = Distance(me, point) / Float(speed)
+        t = Distance(me, point) / speed
         travelled = ball_speed * t - Float(0.5) * a * t * t
         travelled = ConditionalSetFloat(
             CompareFloats(travelled, stop_distance, ">"), stop_distance, travelled
@@ -350,3 +350,8 @@ def predict_ball_meet_point(me, ball, ball_vel, speed):
         parts.y,
         _clamp_axis(parts.z, traj.ZMIN, traj.ZMAX),
     )
+
+
+def predict_ball_meet_point(me, ball, ball_vel, speed):
+    """`speed` is a python float at every call site; params must be Nodes."""
+    return _meet_point(me, ball, ball_vel, Float(speed))

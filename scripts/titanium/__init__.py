@@ -7,7 +7,9 @@ the compiled Unity graph itself is organized conceptually:
     constants     gameplay tuning values (speeds, kick physics, charge)
     geometry      pure geometric primitives (tangents, forbidden cones)
     ball_physics  ball trajectory prediction (event legs, own-goal threat)
-    shot          shot legality + safe walking
+    shot          shot legality + straight walk_target
+    anti_tackle   held-ball rotation dodge (challenger build only)
+    positioning   end-of-tick own-goal + teammate spacing (shared with AT)
     tackle        tackle duty + interact policy
     carrier       ball-carrier movement
     goalkeeper    GK cover/press/policy

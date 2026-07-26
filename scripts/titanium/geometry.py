@@ -8,18 +8,29 @@ from __future__ import annotations
 
 from titanium._env import *  # noqa: F401,F403
 from titanium.constants import ANGLE_EPS
+from titanium.nodefn import graph_function
 
 
 def pos(label: str):
     return RelativePosition(SoccerGetTransform(label), "Self")
 
 
-@cache
-def rotate_xz(v, angle):
-    """Rotate pitch vector around Y by `angle` radians (X/Z plane)."""
+def _rotate_xz_body(v, angle):
+    """Rotation maths as plain inlined nodes.
+
+    Separate from the `rotate_xz` graph function because a function body may not
+    call another function (`titanium.nodefn` rule 3) — `_post_tangent_parts`
+    needs the maths, not the call.
+    """
     c = Cos(angle)
     s = Sin(angle)
     return Vector3(v.x * c - v.z * s, Float(0), v.x * s + v.z * c)
+
+
+@graph_function("TiRotateXZ", ("Vector3", "Float"), "Vector3")
+def rotate_xz(v, angle):
+    """Rotate pitch vector around Y by `angle` radians (X/Z plane)."""
+    return _rotate_xz_body(v, angle)
 
 
 @cache
@@ -29,11 +40,8 @@ def unit_or_zero(v):
 
 @cache
 def clamp01(x):
-    return ConditionalSetFloat(
-        CompareFloats(x, Float(0), "<"),
-        Float(0),
-        ConditionalSetFloat(CompareFloats(x, Float(1), ">"), Float(1), x),
-    )
+    # Native ClampFloat — one node where this used to expand to four.
+    return ClampFloat(x, Float(0), Float(1))
 
 
 @cache
@@ -55,15 +63,26 @@ def opponent_invariants(opp_pos, ball, r_eff, half_angle):
     return toward, cos_a, engulfed
 
 
-@cache
+@graph_function("TiConeBlocks", ("Vector3", "Vector3", "Float", "Bool"), "Bool")
+def _cone_blocks(direction, toward, cos_a, engulfed):
+    """Body of `direction_forbidden` — the most-instantiated shape in the graph
+    (every candidate direction x every opponent).
+
+    The per-opponent `invariant` deliberately stays hoisted OUTSIDE: it is
+    shared across every candidate tested from one origin, so pulling it in here
+    would recompute it per call (`titanium.nodefn` rule 1).
+    """
+    inside = CompareFloats(DotProduct(direction, toward), cos_a, ">=")
+    return Or(engulfed, inside)
+
+
 def direction_forbidden(direction, invariant):
     """True if unit `direction` lies inside the opponent's forbidden cone.
     `invariant` is this opponent's precomputed `(toward, cos_a, engulfed)`
     from `opponent_invariants` — the only part that varies per candidate is
     the dot-product threshold check below."""
     toward, cos_a, engulfed = invariant
-    inside = CompareFloats(DotProduct(direction, toward), cos_a, ">=")
-    return Or(engulfed, inside)
+    return _cone_blocks(direction, toward, cos_a, engulfed)
 
 
 @cache
@@ -98,21 +117,43 @@ def post_tangent(origin, post_center, contact_r):
     Returns `(direction, point)`: unit direction from `origin`, and the
     tangent point itself (handy for debug drawing / literal aim targets).
     """
+    r = Float(contact_r)
+    return post_tangent_dir(origin, post_center, r), post_tangent_point(origin, post_center, r)
+
+
+def _post_tangent_parts(origin, post_center, contact_r):
+    """Shared maths for the two post-tangent functions below.
+
+    Split into a `_dir` and a `_point` function because a graph function returns
+    exactly one value. That split is free in a shipped build: only `debug_viz`
+    ever wants the tangent POINT, and release strips it, so
+    `TiPostTangentPoint` is simply never emitted.
+    """
     offset = post_center - origin
     dist = Magnitude(offset)
     safe_dist = ConditionalSetFloat(CompareFloats(dist, Float(1e-3), "<"), Float(1e-3), dist)
     toward = unit_or_zero(offset)
     alpha = Asin(clamp01(contact_r / safe_dist))
-    cand_a = rotate_xz(toward, alpha)
-    cand_b = rotate_xz(toward, Float(0) - alpha)
-    l_sq = dist * dist - Float(contact_r * contact_r)
+    cand_a = _rotate_xz_body(toward, alpha)
+    cand_b = _rotate_xz_body(toward, Float(0) - alpha)
+    l_sq = dist * dist - contact_r * contact_r
     l = Sqrt(ConditionalSetFloat(CompareFloats(l_sq, Float(0), "<"), Float(0), l_sq))
     point_a = origin + cand_a * l
     point_b = origin + cand_b * l
     inward_is_a = CompareFloats(Abs(point_a.z), Abs(point_b.z), "<=")
-    direction = ConditionalSetVector3(inward_is_a, cand_a, cand_b)
-    point = ConditionalSetVector3(inward_is_a, point_a, point_b)
-    return direction, point
+    return inward_is_a, cand_a, cand_b, point_a, point_b
+
+
+@graph_function("TiPostTangentDir", ("Vector3", "Vector3", "Float"), "Vector3")
+def post_tangent_dir(origin, post_center, contact_r):
+    inward, cand_a, cand_b, _pa, _pb = _post_tangent_parts(origin, post_center, contact_r)
+    return ConditionalSetVector3(inward, cand_a, cand_b)
+
+
+@graph_function("TiPostTangentPoint", ("Vector3", "Vector3", "Float"), "Vector3")
+def post_tangent_point(origin, post_center, contact_r):
+    inward, _a, _b, point_a, point_b = _post_tangent_parts(origin, post_center, contact_r)
+    return ConditionalSetVector3(inward, point_a, point_b)
 
 
 def is_legal_direction(direction, invariants):
@@ -174,3 +215,22 @@ def clamp_own_half(p, team_goal):
     clamp_pos = ConditionalSetFloat(CompareFloats(p.x, Float(0), "<"), Float(0), p.x)
     x = ConditionalSetFloat(defends_negative, clamp_neg, clamp_pos)
     return Vector3(x, p.y, p.z)
+
+
+def closest_point_on_segment(origin, a, b):
+    """Closest point on segment a→b to `origin` (pitch XZ)."""
+    ab = b - a
+    ab_len_sq = DotProduct(ab, ab)
+    ab_len_sq = ConditionalSetFloat(CompareFloats(ab_len_sq, Float(1e-8), "<"), Float(1e-8), ab_len_sq)
+    t = clamp01(DotProduct(origin - a, ab) / ab_len_sq)
+    return a + ab * t
+
+
+def closest_point_on_goal_mouth(origin, left_post, right_post):
+    """Closest point on the usable goal line (segment between posts).
+
+    Same mouth geometry scoring/eval uses: anything between the posts on the
+    goal line is a walk-in finish; outside is wall. Walk toward this point —
+    not the goal center — so the path is the shortest legal score.
+    """
+    return closest_point_on_segment(origin, left_post, right_post)

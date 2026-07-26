@@ -3,7 +3,8 @@ from __future__ import annotations
 
 import math
 
-# MEASURED 2026-07-25 (n=3177): a held ball snaps flush to a wall at
+# MEASURED prefab BallHoldLocation local Z (AIA_UPSTREAM_QUIRKS #21).
+HOLD_OFFSET = 1.67
 # +-39.75/+-24.75 against corners of +-40/+-25, so the collision radius is
 # 0.25 exactly, identical on both axes. 0.4064 is the VISUAL radius from
 # soccer_ball_sim_params.json and is not what the engine collides with.
@@ -27,6 +28,8 @@ POST_AIM_RADIUS = POST_CONTACT_RADIUS + POST_AIM_MARGIN
 ANGLE_EPS = math.radians(0.5)
 WALK_SPEED = 7.0
 SPRINT_SPEED = 8.0
+# Confirmed sim step (aicomp-soccer-sim FIXED_DT).
+FIXED_DT = 0.019
 # Opponent carrier speed while running with the ball. Confirmed measurement
 # (AIA_UPSTREAM_QUIRKS.md #11: walk ~7 m/s flat, no stamina throttle) — same
 # figure as WALK_SPEED, reused directly rather than guessing a separate
@@ -61,3 +64,25 @@ SHOT_CHARGE_TIME_S = 0.38
 # 1.0 and holds it there, so this only needs to clear float noise.
 FULL_CHARGE = 0.99
 HOLD_PROXY = 0.55
+# Ball must stay this far (along pitch X) on the pitch side of our goal plane
+# after an end-of-tick hold so anti-tackle rotation cannot own-goal.
+OWN_GOAL_PLANE_CLEARANCE = HOLD_OFFSET + BALL_RADIUS + 0.5
+# Teammate spacing: never closer than full tackle range (r_int).
+TEAMMATE_MIN_SEP_FRAC = 1.0
+# Support outlets along AT-safe headings: try far→near until clear_pass opens.
+SUPPORT_OUTLET_DISTS = (9.0, 7.5, 6.0, 4.5, 3.5)
+# Pass-danger: AT tracks opps inside 2×r_int of carrier center. When an opp has
+# closed MORE THAN 1/4 of that approach (remaining gap ≤ ¾ of 2×r = 1.5×r_int),
+# holding is too late to wait for body-touch (1×r_int) — seek a pass. Keeping
+# the ball in that window costs KEEP_BALL_DANGER_PENALTY on eval.
+PASS_DANGER_APPROACH_FRAC = 0.25  # "closed more than 1/4 of the way in"
+PASS_DANGER_TRACK_MULT = 2.0  # same 2×r_int bubble as anti_tackle tracking
+KEEP_BALL_DANGER_PENALTY = 2.0
+# Playable AABB — matches aicomp-soccer-sim SimParams fallback / Unity pitch.
+# Held-ball offset is projected into this region (sidelines always; endlines
+# only outside the goal mouth) exactly like `project_hold_into_playable`.
+PITCH_X_MIN = -40.0
+PITCH_X_MAX = 40.0
+PITCH_Z_MIN = -25.0
+PITCH_Z_MAX = 25.0
+GOAL_HALF_WIDTH = 5.7

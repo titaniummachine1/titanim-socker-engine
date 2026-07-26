@@ -29,3 +29,7 @@ BACKUPS_DIR = ROOT.parents[0] / "aicomp-soccer-sim" / "data" / "titanium" / "bac
 # and watched live in-game immediately without waiting on a gate result —
 # separate from SAVES (the real submission file), which only --promote touches.
 SAVES_TEST = SAVES.parent / "Titanium_test.txt"
+# Same bytes in the sim repo so watch_bots / headless can load without Unity path.
+LOCAL_TEST = LOCAL_OUT.parent / "Titanium_test.txt"
+# Challenger mirror under Unity Saves (pick "Titanium_challenger" in-game).
+SAVES_CHALLENGER = SAVES.parent / "Titanium_challenger.txt"

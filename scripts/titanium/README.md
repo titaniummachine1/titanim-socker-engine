@@ -3,14 +3,54 @@
 Build from the repo root above:
 
 ```
-python scripts\build_titanium.py            # candidate only -> Titanium_test
-python scripts\build_titanium.py --promote  # ONLY after it wins a gate
+python scripts\build_titanium.py                         # release (default)
+python scripts\build_titanium.py --promote               # gate winner only
+python scripts\build_titanium.py --with-anti-tackle      # challenger (release)
+python scripts\build_titanium.py --debug                 # keep DebugDraw/TimePlot
 ```
+
+`--strip-debug` still works as a no-op alias for release. Use `--debug` / `--normal`
+only when inspecting sinks.
+
+Graph optimisation is **only** via `AIGamePyLibrary.SaveData(optimize=...)` —
+do not add duplicate prune passes in `deploy.py`.
+
+## Keeping the graph from bloating
+
+Every node evaluates every tick, and the save format costs ~576 B per node and
+~951 B per connection (that format is the game's — `Haialand-v2.txt` pays the
+same rate), so node count IS both file size and per-tick work.
+
+```
+python scripts\build_titanium.py --profile            # who emitted what, vs baseline
+python scripts\build_titanium.py --profile --baseline # accept current as the new baseline
+python scripts\equivalence.py --against <graph.txt>   # did this refactor change any decision?
+python scripts\fn_contract_probe.py                   # re-verify the graph-function contract
+```
+
+`--profile` reports nodes AND per-tick evaluations separately, because a
+`nodefn` function shrinks the file while evaluating its body once per call —
+the two numbers can move in opposite directions and only the profile shows it.
+
+`equivalence.py` runs the roster both sides through the deterministic sim and
+diffs the match statistics. Identical possession-to-float-precision and tick
+counts over 180 s means the change altered no decision, so it can be promoted
+without re-gating. A change that DIVERGES is a behaviour change and still owes
+the full gate below.
+
+`fn_contract_probe.py` + `aicomp-soccer-sim`'s `probe_dump` empirically check
+what graph functions actually do (multi-call independence, params, globals in
+bodies, nesting). Run it rather than trusting any doc — including this one.
+Note it already contradicts `build_function_nesting_probe.py`, whose docstring
+claims nesting reads back null; in the sim it works.
 
 | module | what it owns |
 | --- | --- |
+| `nodefn.py` | `@graph_function` — emit a repeated subgraph ONCE, call it N times |
+| `profile.py` | `--profile`: node/eval attribution + regression vs a baseline |
 | `graph.py` | wiring: per-player controllers, what each slot does |
 | `constants.py` | measured physics — do not "tidy" these, they are measurements |
+| `anti_tackle.py` | **challenger only** — 5-probe binary search on held-ball heading |
 | `ball_physics.py` | trajectory, own-goal threat, meet point (approximation, see below) |
 | `goalkeeper.py` | GK policy; the only place allowed to sprint outside a 50/50 |
 | `tackle.py` | who presses Interact on a carrier |

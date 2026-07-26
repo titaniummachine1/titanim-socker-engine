@@ -1,39 +1,67 @@
-"""Ball-carrier movement: walk a safe lane, snap onto the shot the instant
-a lane opens."""
+"""Ball-carrier: shoot if free; else AT max-eval forward walk; else pass (never retreat)."""
 from __future__ import annotations
 
 from titanium._env import *  # noqa: F401,F403
-from titanium.constants import FULL_CHARGE
-from titanium.shot import clear_shot, safe_walk_target
+from titanium.constants import FULL_CHARGE, KEEP_BALL_DANGER_PENALTY
+from titanium.shot import best_escape_pass, clear_shot, walk_target
 
 
-def build_carrier_move(me, ball, opp_goal, opp_left_post, opp_right_post, opponents, r_eff, has_ball, charge):
-    """With ball: walk a safe lane toward goal sitting on a full charge, and
-    on the tick a scoring lane opens snap MoveTo onto the aim direction.
+def build_carrier_move(
+    slot,
+    me,
+    ball,
+    opp_goal,
+    team_goal,
+    opp_left_post,
+    opp_right_post,
+    opponents,
+    teammates,
+    r_int,
+    r_eff,
+    has_ball,
+    charge,
+):
+    """AT picks safe+forward max-eval walk. If only back is safe (or none) → pass."""
+    from titanium import anti_tackle, debug_viz, positioning
+    from titanium._env import WITH_ANTI_TACKLE
 
-    The snap *is* the aim — the engine kicks along MoveTo — so the release
-    and the snap have to land on the same tick. That is why `shoot_now` is
-    returned rather than recomputed: it must drive Interact too.
-
-    The `charge` gate is not optional. Releasing means dropping Interact, and
-    Interact is also what *builds* the charge — so firing the moment a lane
-    happens to be open (which, on pickup in space, is immediately) holds the
-    ball at zero charge forever: the engine needs >0.05 to kick at all, so
-    nothing is ever struck. Wait for the charge to actually be banked, then
-    spend it.
-    """
-    # Shot origin is the CARRIER, not the ball's transform: the real engine
-    # visually orbits the held ball at an offset in front of the player, but
-    # the actual kick fires from the player's own center. Aiming the tangent
-    # geometry from `ball` (the offset position) instead of `me` was solving
-    # a slightly wrong triangle every time.
     lane_ok, aim = clear_shot(me, opp_goal, opp_left_post, opp_right_post, opponents, r_eff)
     ready = CompareFloats(charge, Float(FULL_CHARGE), ">=")
     shoot_now = And(has_ball, And(lane_ok, ready))
-    walk = safe_walk_target(me, ball, opp_goal, opponents, r_eff)
+
+    # Carrier stam for AT/ghost filter — Ball Carrier is authoritative while holding.
+    my_stam = SoccerGetFloat("Ball Carrier Stamina")
+    danger = And(
+        has_ball,
+        positioning.opponent_in_pass_danger(me, opponents, r_int, my_stam),
+    )
+    mates = list(teammates)
+    can_pass, pass_dir, _pass_mate = best_escape_pass(me, mates, opponents, r_eff)
+
+    if WITH_ANTI_TACKLE:
+        walk, at_debug = anti_tackle.carrier_walk_target(
+            me, opp_goal, ball, opponents, r_int, team_goal, my_stam, danger
+        )
+        # need_pass: no safe forward walk (would only retreat) OR pass-danger.
+        want_pass = Or(at_debug["need_pass"], danger)
+        pass_now = And(has_ball, And(ready, And(can_pass, And(want_pass, Not(shoot_now)))))
+        at_debug = dict(at_debug)
+        at_debug["pass_danger"] = danger
+        at_debug["keep_penalty"] = ConditionalSetFloat(
+            And(danger, Not(Or(shoot_now, pass_now))),
+            Float(KEEP_BALL_DANGER_PENALTY),
+            Float(0),
+        )
+        debug_viz.plot_anti_tackle(slot, has_ball, at_debug)
+    else:
+        walk = walk_target(me, opp_goal)
+        pass_now = And(has_ball, And(ready, And(can_pass, And(danger, Not(shoot_now)))))
+
+    release_now = Or(shoot_now, pass_now)
     shoot_to = me + aim * Float(10)
+    pass_to = me + pass_dir * Float(10)
     move = ConditionalSetVector3(shoot_now, shoot_to, walk)
-    # Without ball: chase ball with same cone (avoid running through tacklers).
-    chase = safe_walk_target(me, ball, ball, opponents, r_eff, step=8.0)
+    move = ConditionalSetVector3(pass_now, pass_to, move)
+    chase = walk_target(me, ball, step=8.0)
     move = ConditionalSetVector3(has_ball, move, chase)
-    return move, shoot_now
+    return move, release_now

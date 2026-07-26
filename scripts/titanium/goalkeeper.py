@@ -23,7 +23,7 @@ from titanium.geometry import (
     pos,
     unit_or_zero,
 )
-from titanium.shot import safe_walk_target
+from titanium.shot import walk_target
 from titanium.tackle import player_interact
 
 
@@ -82,7 +82,9 @@ def gk_cover_stand(shot_origin, team_goal, left_post, right_post, interact_r, ch
         cut_r = CompareFloats(cross_r * dist_sb, interact_r, "<=")
         return And(between, And(cut_l, cut_r))
 
-    cover = ConditionalSetVector3(seals(cover), cover, cover_home)
+    # Applied ONCE: `f(x) = seals(x) ? x : home` is idempotent. If seals(x)
+    # then f(x)=x, so f(f(x))=f(x); otherwise f(x)=home and f(home) is home
+    # either way. A second application was pure cost (126 nodes / 228 edges).
     cover = ConditionalSetVector3(seals(cover), cover, cover_home)
     return cover, seals
 
@@ -201,23 +203,13 @@ def gk_policy(
     interact_r = SoccerGetFloat("Player Interact Radius")
     cover, seals = gk_cover_stand(ball, team_goal, left_post, right_post, interact_r)
 
-    # With ball: clear upfield; do not sprint for the clear walk-up.
-    #
-    # Routed through the same forbidden-cone avoidance the outfielders use
-    # (`safe_walk_target`) rather than a raw walk toward `clear_dir` — a GK
-    # who just won the ball deep in his own box is standing right next to
-    # whoever he took it from, and a blind walk toward the clear direction
-    # can carry him straight past that opponent, handing back an instant
-    # re-tackle a few metres from our own goal (confirmed via
-    # titanium_matchtrace: exactly this sequence conceded a goal at t=36.8s
-    # of an AIA3 match — GK wins the ball at x=-38, walks to clear, gets
-    # retackled by the stationary opponent one tick later, ball walked in).
+    # With ball: clear upfield; walk straight toward the clear direction.
     clear_dir = SoccerGetVector3("Clear direction from Teammate 4")
     clear_target = gk + unit_or_zero(clear_dir) * Float(14)
     clear_target = ConditionalSetVector3(
         IsNull(clear_dir), pos("Opponent Goal Center"), clear_target
     )
-    clear_spot = safe_walk_target(gk, ball, clear_target, opponents, r_eff, step=14)
+    clear_spot = walk_target(gk, clear_target, step=14)
     move = ConditionalSetVector3(has_ball, clear_spot, cover)
 
     # Sprint ONLY to intercept a free ball whose predicted path crosses our

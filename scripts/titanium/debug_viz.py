@@ -9,9 +9,10 @@ from __future__ import annotations
 
 from titanium._env import *  # noqa: F401,F403
 from titanium._env import traj
-from titanium.constants import CARRIER_SPEED, POST_AIM_RADIUS, SPRINT_SPEED
+from titanium.constants import POST_AIM_RADIUS, SPRINT_SPEED
 from titanium.ball_physics import airborne_hang_time, trajectory_breakpoints
 from titanium.geometry import post_tangent
+from titanium.shot import unopposed_walk_in
 
 OFF_PITCH = Vector3(Float(999), Float(0), Float(999))
 
@@ -240,31 +241,70 @@ def draw_ball_path_and_threats(ball, ball_vel, loose, team4, opponents, opp_goal
     # They're predicted to receive it: threat tree points at OUR goal.
     draw_threat_from(owner_pos, they_receive, team_goal, left_post, right_post, opponents, "Red")
 
-    # Guaranteed unopposed walk-in: from the predicted receiver, would a
-    # straight walk (dribble speed, not sprint) to the goal center reach it
-    # before ANY of the defending team's 4 players could get there — checked
-    # at several points along that walk, not just the final one, so a
-    # defender who could cut across mid-path still counts as a stop. If
-    # nobody beats them anywhere along it, this is a real "just walk it in
-    # and score" scenario, not merely "closest to the ball right now."
-    def draw_unopposed_walk(active, origin, goal_pt, defenders, color):
-        total_dist = Distance(origin, goal_pt)
-        total_time = total_dist / Float(CARRIER_SPEED)
-        unopposed = Bool(True)
-        for frac in (0.25, 0.5, 0.75, 1.0):
-            sample_pt = origin + (goal_pt - origin) * Float(frac)
-            sample_time = total_time * Float(frac)
-            fastest_def = Distance(defenders[0], sample_pt) / Float(SPRINT_SPEED)
-            for d in defenders[1:]:
-                dt = Distance(d, sample_pt) / Float(SPRINT_SPEED)
-                fastest_def = ConditionalSetFloat(CompareFloats(dt, fastest_def, "<"), dt, fastest_def)
-            beaten_here = CompareFloats(fastest_def, sample_time, "<=")
-            unopposed = And(unopposed, Not(beaten_here))
+    # Guaranteed unopposed walk-in: shortest path into the usable mouth
+    # (closest point on the post–post goal-line segment), same geometry as
+    # scoring eval — not the goal center. Race samples along that walk.
+    def draw_unopposed_walk(active, origin, gl_post, gr_post, defenders, color):
+        unopposed, goal_pt = unopposed_walk_in(origin, gl_post, gr_post, defenders)
         show = And(active, unopposed)
         DebugDrawLine(ConditionalSetVector3(show, origin, OFF_PITCH), ConditionalSetVector3(show, goal_pt, OFF_PITCH), Float(0.12), color)
         DebugDrawDisc(ConditionalSetVector3(show, goal_pt, OFF_PITCH), Float(0.5), Float(0.35), color)
 
     # Danger: they receive it and nobody on our side can stop the walk-in.
-    draw_unopposed_walk(they_receive, owner_pos, team_goal, team4, "Black")
+    draw_unopposed_walk(they_receive, owner_pos, left_post, right_post, team4, "Black")
     # Opportunity: we receive it and nobody on their side can stop it either.
-    draw_unopposed_walk(we_receive, owner_pos, opp_goal, opponents, "Gray")
+    draw_unopposed_walk(we_receive, owner_pos, opp_left_post, opp_right_post, opponents, "Gray")
+
+
+def plot_anti_tackle(slot: int, has_ball, debug: dict) -> None:
+    """TimePlot anti-tackle diagnostics for post-game tackle forensics.
+
+    FailReason (read after a match in TimePlot):
+      0 — carrying and a safe heading was found (or predicted safe)
+      1 — carrying but no probe found a safe ball angle this tick
+      2 — lost the ball this tick after last tick predicted safe (miscalculation)
+    """
+    prefix = f"Titanium.P{slot}.AT"
+    any_safe = debug["any_safe"]
+    predicted_safe = debug["predicted_safe"]
+    had_ball_key = f"{prefix}.HadBall"
+    pred_key = f"{prefix}.PredSafe"
+
+    was_carrying = CompareFloats(GetVariable(had_ball_key), Float(0.5), ">")
+    pred_was_safe = CompareFloats(GetVariable(pred_key), Float(0.5), ">")
+    opp_has = SoccerGetBool("Opponent Has Ball")
+    miscalc = And(Not(has_ball), And(was_carrying, And(pred_was_safe, opp_has)))
+
+    fail = Float(0)
+    fail = ConditionalSetFloat(And(has_ball, Not(any_safe)), Float(1), fail)
+    fail = ConditionalSetFloat(miscalc, Float(2), fail)
+
+    pred_f = ConditionalSetFloat(predicted_safe, Float(1), Float(0))
+    any_f = ConditionalSetFloat(any_safe, Float(1), Float(0))
+
+    TimePlot(String(f"{prefix}.FailReason"), "Yellow", String(""), fail)
+    TimePlot(String(f"{prefix}.PredictedSafe"), "Cyan", String(""), pred_f)
+    TimePlot(String(f"{prefix}.AnySafeFound"), "Green", String(""), any_f)
+    TimePlot(String(f"{prefix}.ChosenOffset"), "White", String(""), debug["chosen_offset"])
+    if "pass_danger" in debug:
+        TimePlot(
+            String(f"{prefix}.PassDanger"),
+            "Orange",
+            String(""),
+            ConditionalSetFloat(debug["pass_danger"], Float(1), Float(0)),
+        )
+    if "keep_penalty" in debug:
+        TimePlot(String(f"{prefix}.KeepPenalty"), "Red", String(""), debug["keep_penalty"])
+    if "best_eval" in debug:
+        TimePlot(String(f"{prefix}.BestEval"), "Cyan", String(""), debug["best_eval"])
+    if "need_pass" in debug:
+        TimePlot(
+            String(f"{prefix}.NeedPass"),
+            "Orange",
+            String(""),
+            ConditionalSetFloat(debug["need_pass"], Float(1), Float(0)),
+        )
+
+    SetVariable(had_ball_key, ConditionalSetFloat(has_ball, Float(1), Float(0)))
+    SetVariable(pred_key, ConditionalSetFloat(has_ball, pred_f, Float(0)))
+

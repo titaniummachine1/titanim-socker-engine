@@ -1,0 +1,42 @@
+{
+  "anti_tackle": {
+    "by_module": {
+      "<unattributed>": 10,
+      "ball_trajectory_graph": 1155,
+      "titanium/anti_tackle.py": 974,
+      "titanium/ball_physics.py": 77,
+      "titanium/carrier.py": 47,
+      "titanium/debug_viz.py": 78,
+      "titanium/geometry.py": 528,
+      "titanium/goalkeeper.py": 194,
+      "titanium/graph.py": 83,
+      "titanium/nodefn.py": 229,
+      "titanium/positioning.py": 145,
+      "titanium/shot.py": 78,
+      "titanium/support_outlets.py": 129,
+      "titanium/tackle.py": 100
+    },
+    "connections": 7499,
+    "evals": 6012,
+    "nodes": 3827
+  },
+  "plain": {
+    "by_module": {
+      "<unattributed>": 4,
+      "ball_trajectory_graph": 735,
+      "titanium/ball_physics.py": 77,
+      "titanium/carrier.py": 42,
+      "titanium/debug_viz.py": 45,
+      "titanium/geometry.py": 380,
+      "titanium/goalkeeper.py": 194,
+      "titanium/graph.py": 90,
+      "titanium/nodefn.py": 93,
+      "titanium/positioning.py": 130,
+      "titanium/shot.py": 80,
+      "titanium/tackle.py": 103
+    },
+    "connections": 3775,
+    "evals": 3236,
+    "nodes": 1973
+  }
+}

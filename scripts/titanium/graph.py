@@ -7,6 +7,7 @@ lives.
 from __future__ import annotations
 
 from titanium._env import *  # noqa: F401,F403
+from titanium._env import WITH_ANTI_TACKLE
 from titanium.constants import BALL_RADIUS, SPRINT_SPEED, WALK_SPEED
 from titanium.geometry import pos, unit_or_zero
 from titanium.shot import nearest_opponent_dist
@@ -14,19 +15,76 @@ from titanium.carrier import build_carrier_move
 from titanium.ball_physics import predict_ball_meet_point
 from titanium.goalkeeper import gk_policy, threat_cover
 from titanium.tackle import player_interact
-from titanium import debug_viz
+from titanium import debug_viz, positioning
+from titanium import support_outlets
+
+
+# Own goal line. Faceoff coordinates are world absolute, so this is a distance
+# from the centre spot, not from our end.
+GOAL_LINE_X = 40.0
+# Keeper stands this far off its own goal, up the goal-centre→ball line. The
+# ball is on the centre spot at a kickoff, so that line is just straight out.
+GK_FROM_GOAL = 10.0
+# Where the engine pushes a receiving player to: circle 7.25 + measured 0.50
+# clearance (Test1/Test2 probes, 2026-07-26). Standing here already means the
+# push is a no-op and the shape survives the whistle intact.
+CIRCLE_STANDOFF = 7.75
+# Wall gap either side of the middle player. Bodies are 0.655 radius, so this
+# is a shade over two body widths — a wall, not a pile.
+WALL_SPACING = 3.0
+
+
+def _faceoff_spots():
+    """Kickoff spawn spots, arranged by hand in the viewer.
+
+    Measured in the real game 2026-07-26 (Test1/Test2 probes): these are WORLD
+    ABSOLUTE coordinates, not our own half's frame. There is no mirroring, so
+    the same four numbers played from the other end land in the opponent's
+    half, where the engine drags them onto the halfway line — which is exactly
+    what the original hand-written spots did to three of our four players.
+
+    So every spot is multiplied by ±1 chosen from `Is Home Team`. One side is
+    authored and the other is the same numbers with the sign flipped, which is
+    all the mirroring amounts to: the away view is the same pitch rotated 180°,
+    not reflected, so X and Z flip together. Home defends −X and takes −1.
+
+    Two shapes, switched on whose kickoff it is.
+
+    OURS: P1 stands on the ball, P2/P3 form a wall either side of it. Standing
+    in the circle is legal only for the kicking side, and starting on the spot
+    means the first touch is immediate instead of after a walk-in.
+
+    THEIRS: the engine would shove anyone inside the circle out to radius 7.75
+    anyway, in whatever direction they happen to lie from the centre. Rather
+    than be thrown somewhere arbitrary, P1 is placed ON that radius already, on
+    our own side of the circle — same distance the push would have produced,
+    but pointing at our goal instead of wherever. P2/P3 keep the wall, set back
+    with it. Nobody gets moved, so what is drawn here is what plays.
+
+    The keeper ignores both and sits `GK_FROM_GOAL` up the goal-centre→ball
+    line, which at a kickoff is simply straight out from goal.
+    """
+    tm = ConditionalSetFloat(SoccerGetBool("Is Home Team"), Float(-1), Float(1))
+
+    def spot(x, z):
+        return ScaleVector3(Vector3(Float(x), Float(0), Float(z)), tm)
+
+    ours = SoccerGetBool("Is Team Kicking off")
+
+    def wall(z):
+        """Same wall slot, on the ball when kicking / on the arc when not."""
+        return ConditionalSetVector3(ours, spot(0.0, z), spot(CIRCLE_STANDOFF, z))
+
+    return (
+        wall(0.0),
+        wall(-WALL_SPACING),
+        wall(WALL_SPACING),
+        spot(GOAL_LINE_X - GK_FROM_GOAL, 0.0),
+    )
 
 
 def build() -> None:
-    # Faceoff (team space: +X attack)
-    InitializeSoccer(
-        "Titanium",
-        "Poland",
-        Vector3(Float(8), Float(0), Float(3)),
-        Vector3(Float(6), Float(0), Float(-6)),
-        Vector3(Float(6), Float(0), Float(6)),
-        Vector3(Float(-14), Float(0), Float(0)),
-    )
+    InitializeSoccer("Titanium", "Poland", *_faceoff_spots())
 
     ball = pos("Ball")
     opp_goal = pos("Opponent Goal Center")
@@ -86,36 +144,77 @@ def build() -> None:
     # With the ball, the same players push forward and take the shot the tick
     # a lane opens (`build_carrier_move`), sitting on a permanently full
     # charge until then.
-    # Attacking shape, ball-relative. `fwd` is the attack axis and `lat` is
-    # its left-hand perpendicular in the pitch plane, so the stations rotate
-    # with the direction of play instead of being pinned to world axes.
-    #
-    # Every outfielder previously computed the SAME support target and they
-    # duly walked into one pile — four bodies inside a few metres, nobody
-    # anywhere else to pass to, attack stalled with the ball stuck in a
-    # corner. Distinct stations are what stop that: two wide either side and
-    # ahead of the ball to stretch the defence, one trailing goal-side as the
-    # safe backward outlet (which is also the receiver the carrier will look
-    # for when it cannot escape a tackle).
+    # Attacking shape: distinct L/R/trail stations so supports do not pile.
+    # With AT: stations sit on AT-safe hold rays (red ball dirs) and are
+    # pulled in until clear_pass from the carrier — helpers must be where the
+    # carrier can actually throw, not where a marker obscures half the cone.
+    # Without AT: fixed ball-relative flanks (legacy).
     fwd = unit_or_zero(opp_goal - ball)
     lat = Vector3(Float(0) - fwd.z, Float(0), fwd.x)
 
-    for slot, me, marks, ahead, side in (
-        (1, p1, opponents[0], 9.0, 7.0),
-        (2, p2, opponents[1], 9.0, -7.0),
-        (3, p3, opponents[2], -6.0, 0.0),
+    # Carrier body is the hard spacing priority — helpers yield around him.
+    h1 = SoccerGetBool("Team Player 1 Has Ball")
+    h2 = SoccerGetBool("Team Player 2 Has Ball")
+    h3 = SoccerGetBool("Team Player 3 Has Ball")
+    carrier = ConditionalSetVector3(
+        h1, p1, ConditionalSetVector3(h2, p2, ConditionalSetVector3(h3, p3, p4))
+    )
+
+    if WITH_ANTI_TACKLE:
+        carrier_stam = SoccerGetFloat("Ball Carrier Stamina")
+        left_o, right_o, trail_o = support_outlets.at_safe_flank_stations(
+            carrier,
+            ball,
+            opp_goal,
+            team_goal,
+            opponents,
+            r_int,
+            r_eff,
+            carrier_stam,
+        )
+        raw_support = [left_o, right_o, trail_o]
+        debug_viz.plot_xz("Titanium.Support.Left", "Yellow", left_o)
+        debug_viz.plot_xz("Titanium.Support.Right", "Yellow", right_o)
+        debug_viz.plot_xz("Titanium.Support.Trail", "Yellow", trail_o)
+    else:
+        raw_support = []
+        for ahead, side in ((9.0, 7.0), (9.0, -7.0), (-6.0, 0.0)):
+            raw_support.append(ball + fwd * Float(ahead) + lat * Float(side))
+
+    outfield = [p1, p2, p3]
+    for slot, me, marks, raw in (
+        (1, p1, opponents[0], raw_support[0]),
+        (2, p2, opponents[1], raw_support[1]),
+        (3, p3, opponents[2], raw_support[2]),
     ):
         has = SoccerGetBool(f"Team Player {slot} Has Ball")
         charge = SoccerGetFloat(f"Teammate {slot} Shot Charge")
         closest = SoccerGetBool(f"Is Team Player {slot} Closest Teammate to Ball")
 
+        mates = [p for i, p in enumerate(outfield) if i != (slot - 1)]
         carry, shoot_now = build_carrier_move(
-            me, ball, opp_goal, opp_left_post, opp_right_post, opponents, r_eff, has, charge
+            slot,
+            me,
+            ball,
+            opp_goal,
+            team_goal,
+            opp_left_post,
+            opp_right_post,
+            opponents,
+            mates,
+            r_int,
+            r_eff,
+            has,
+            charge,
         )
         # Defensive default: seal our assigned opponent's shot cone.
         move = threat_cover(marks, team_goal, left_post, right_post, r_int)
-        # Attacking: hold this player's own station in the shape.
-        support = ball + fwd * Float(ahead) + lat * Float(side)
+        # Attacking: helpers clear ≥r_int from carrier (priority) + mates.
+        # Carrier path is never clamped — helpers yield, attacker keeps moving.
+        mate_anchors = [p for i, p in enumerate(outfield) if i != (slot - 1)]
+        support = positioning.clamp_support_station(
+            me, raw, mate_anchors, r_int, priority_anchor=carrier
+        )
         move = ConditionalSetVector3(And(team_has, Not(has)), support, move)
         move = ConditionalSetVector3(has, carry, move)
 
