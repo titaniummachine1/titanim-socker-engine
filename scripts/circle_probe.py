@@ -84,8 +84,24 @@ KICKOFF_VAR = "_MatchProbeKickoffs"
 WAS_KICKOFF_VAR = "_MatchProbeWasKickoff"
 DIR_VAR = "_MatchProbeDir"
 
-Z_LIMIT = 15.0
-OVERSHOOT = 20.0
+# Turn around HERE, aim THERE. Both are inside the +-25 pitch, so the carrier
+# never reaches the target and never pins against a wall — an unreachable
+# target is what keeps him walking, but only if it is still on the field.
+# Aiming at +-35 walked him into the top boundary and he stuck there.
+# Interact pulse: ramp units per press/release cycle. Kept short so a dropped
+# ball is re-claimed within a fraction of a second.
+PULSE_PERIOD = 12.0
+Z_TURN = 15.0
+Z_AIM = 22.0
+# Ramp ticks per full up-down cycle. The ramp rises once per tick (52.63/s
+# measured), so 420 is a ~4 s half-stroke — long enough to cover ground, short
+# enough that a stall is obvious on the plot.
+PACE_PERIOD = 840.0
+# Distinct parking spots per slot. They MUST differ: when every idle player sat
+# on the same point, a player the game removed was indistinguishable from one
+# standing still, which is exactly why the 3v3 removal was invisible in the
+# 2026-07-26 14:23 recording.
+PARK = {1: (26.0, -14.0), 2: (26.0, 14.0), 3: (32.0, -7.0), 4: (32.0, 7.0)}
 # Stand-in for a null Vector3, far outside the +-40 x +-25 pitch so it can never
 # be confused with a real reading.
 NULL_SENTINEL = -999.0
@@ -103,6 +119,12 @@ PRESENCE_FLOATS = (
     "Team Possession %", "Opponent Possession %",
 )
 PRESENCE_BOOLS = ("Is Active Graph", "Is Kickoff")
+# Independent of position: a removed player's distance-to-nearest-opponent
+# should behave differently from a parked one. Two unrelated signals beat one.
+# Trimmed to the bare minimum: 51 channels x 9474 samples nearly crashed the
+# real game's export. Positions alone identify a removal; the stamina and
+# distance corroborators cost 8 more channels than the run can afford.
+PRESENCE_FLOAT_PREFIXES = ()
 
 
 def _short(label: str) -> str:
@@ -154,25 +176,33 @@ def main() -> None:
     ramp = GetVariable(RAMP_VAR)
     SetVariable(RAMP_VAR, ramp + Float(1))
 
-    ball = RelativePosition(SoccerGetTransform("Ball"), "Self")
-    me = RelativePosition(SoccerGetTransform("Team Player 1"), "Self")
-    has_ball = SoccerGetBool("Team Player 1 Has Ball")
+    def pacing_for(slot: int):
+        """Up-and-down target for `slot`, turning on its OWN z.
 
-    # --- pace up and down, turning at +-Z_LIMIT ---------------------------
-    # Bang-bang on a stored direction, with the turnaround driven by the
-    # carrier's own position rather than a timer, so it self-corrects after a
-    # bump. The stored value is a flag, not an accumulator, so a repeated write
-    # in one tick is harmless.
-    going_up = CompareFloats(GetVariable(DIR_VAR), Float(0), ">=")
-    at_top = CompareFloats(me.z, Float(Z_LIMIT), ">=")
-    at_bottom = CompareFloats(me.z, Float(0) - Float(Z_LIMIT), "<=")
-    new_up = ConditionalSetBool(at_top, Bool(False),
-                                ConditionalSetBool(at_bottom, Bool(True), going_up))
-    SetVariable(DIR_VAR, ConditionalSetFloat(new_up, Float(1), Float(0) - Float(1)))
-    target_z = ConditionalSetFloat(
-        new_up, Float(Z_LIMIT + OVERSHOOT), Float(0) - Float(Z_LIMIT + OVERSHOOT))
-    pacing = Vector3(me.x, Float(0), target_z)
-    p1_target = ConditionalSetVector3(has_ball, pacing, ball)
+        Position-based, not timer-based. The ramp cannot be used for timing:
+        it rose 52.63/s in one build and 72.49/s in the next, because an
+        increment executes once per CONSUMER, so its rate depends on graph
+        shape. Position has no such problem, and the transform read is world
+        scale (a carrier reached z = 24.01, i.e. the real pitch edge).
+
+        Hysteresis via a stored per-slot direction, so the flip happens at
+        +-Z_TURN and not repeatedly around one threshold.
+        """
+        var = f"{DIR_VAR}{slot}"
+        me_z = Vector3Split(
+            RelativePosition(SoccerGetTransform(f"Team Player {slot}"), "Self")).z
+        going_up = CompareFloats(GetVariable(var), Float(0), ">=")  # 0 => start up
+        at_top = CompareFloats(me_z, Float(Z_TURN), ">=")
+        at_bottom = CompareFloats(me_z, Float(0) - Float(Z_TURN), "<=")
+        new_up = ConditionalSetBool(
+            at_top, Bool(False), ConditionalSetBool(at_bottom, Bool(True), going_up))
+        # A flag, not an accumulator: rewriting it twice in a tick is harmless.
+        SetVariable(var, ConditionalSetFloat(new_up, Float(1), Float(0) - Float(1)))
+        return ConditionalSetVector3(
+            new_up,
+            Vector3(Float(0), Float(0), Float(Z_AIM)),
+            Vector3(Float(0), Float(0), Float(0) - Float(Z_AIM)),
+        )
 
     # --- restart counter (rising edge) ------------------------------------
     is_kickoff = SoccerGetBool("Is Kickoff")
@@ -210,7 +240,8 @@ def main() -> None:
 
     def wanted_float(label: str) -> bool:
         if PRESENCE:
-            return label in PRESENCE_FLOATS
+            return (label in PRESENCE_FLOATS
+                    or label.startswith(PRESENCE_FLOAT_PREFIXES))
         return skip_all or "to nearest Opponent" not in label
 
     def wanted_bool(label: str) -> bool:
@@ -279,12 +310,55 @@ def main() -> None:
     # Offline readout for probe_dump (TimePlot is a null stub headless).
     DebugDrawDisc(Vector3(ramp, Float(0), Float(0)), Float(0.1), Float(0.1), "White")
 
-    # P1 carries; the rest hold station so they cannot steal off their own
-    # carrier or crowd the lane.
-    SoccerController(1, p1_target, Bool(False), Bool(True))
-    for slot in (2, 3, 4):
-        here = RelativePosition(SoccerGetTransform(f"Team Player {slot}"), "Self")
-        SoccerController(slot, here, Bool(False), Bool(False))
+    # --- controllers: WHOEVER holds the ball paces --------------------------
+    # The carrier is assigned dynamically, not hardcoded to P1. The game removes
+    # players as the match runs (confirmed: the scoreboard shows 3v3), so a
+    # fixed carrier gets deleted mid-match, nobody herds the ball, and the
+    # stale-ball whistle starts firing.
+    #
+    # Everyone holds Interact permanently: it charges a shot but never releases
+    # (release happens on the falling edge), so the ball can never be kicked and
+    # no goal can be scored by either side — and any player adjacent to a loose
+    # ball claims it automatically. That is what makes the handover work without
+    # needing the ball's position in an ambiguous coordinate frame.
+    #
+    # Parking spots are LITERAL world coordinates, never the player's own
+    # read-back position: `RelativePosition(t, "Self")` is relative to the
+    # evaluating player, so "move_to = my own position" is ~(0,0) — the centre
+    # spot. Every idle player walked there and stopped, on both teams, which is
+    # the bug that masked the removals.
+    # Ball position reads at world scale (an earlier export ranged -40.64..18.95).
+    ball = RelativePosition(SoccerGetTransform("Ball"), "Self")
+
+    for slot in (1, 2, 3, 4):
+        mine = SoccerGetBool(f"Team Player {slot} Has Ball")
+        # SOMEBODY must go and get it. Without this the ball is never claimed:
+        # every player either paces (needs the ball) or parks, so a kickoff
+        # leaves it sitting on the centre spot until the stale-ball whistle
+        # fires, which restarts the kickoff, which whistles again — a loop that
+        # never plays a single second of football.
+        #
+        # The fetcher is chosen dynamically by the engine's own "closest
+        # teammate" flag rather than hardcoded, so it survives the removals:
+        # whoever is left and nearest goes, and exactly one player goes.
+        fetch = SoccerGetBool(f"Is Team Player {slot} Closest Teammate to Ball")
+        px, pz = PARK[slot]
+        target = ConditionalSetVector3(fetch, ball, spot(px, pz))
+        target = ConditionalSetVector3(mine, pacing_for(slot), target)
+        # Interact is an IMPULSE, not a held advantage (confirmed by the game's
+        # author). Holding it only helps to CHARGE a shot; a claim or a tackle
+        # fires once on the press and needs a RELEASE before it can fire again.
+        # Holding it permanently therefore claims the ball exactly once — lose
+        # it and the player can never take it back.
+        #
+        # So: hold while carrying (that is the charge, and it is the one case
+        # holding helps), and otherwise pulse, giving a fresh rising edge a few
+        # times a second. Duty comes from the ramp because reads are idempotent;
+        # a flag that inverted itself would be corrupted by the repeated writes
+        # this graph layer is prone to.
+        pulse = CompareFloats(Modulo(ramp, Float(PULSE_PERIOD)),
+                              Float(PULSE_PERIOD / 2.0), "<")
+        SoccerController(slot, target, Bool(False), Or(mine, pulse))
 
     out = os.path.join(SOCCER_SAVES, "MatchProbe.txt")
     os.makedirs(SOCCER_SAVES, exist_ok=True)

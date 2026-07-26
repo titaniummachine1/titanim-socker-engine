@@ -39,19 +39,23 @@ SOCCER_SAVES = os.path.join(
 def main() -> None:
     # Spawn deep in our own half and spread out, so the blank side is nowhere
     # near the centre circle and cannot accidentally block the carrier.
-    spawns = [
-        Vector3(Float(30), Float(0), Float(0)),
-        Vector3(Float(34), Float(0), Float(-8)),
-        Vector3(Float(34), Float(0), Float(8)),
-        Vector3(Float(38), Float(0), Float(0)),
-    ]
-    InitializeSoccer("Blank", "Poland", *spawns)
+    # World-absolute faceoff coordinates, mirrored off `Is Home Team` the same
+    # way `titanium.graph._faceoff_spots` does.
+    side = ConditionalSetFloat(SoccerGetBool("Is Home Team"), Float(-1), Float(1))
 
-    for slot in (1, 2, 3, 4):
-        here = RelativePosition(SoccerGetTransform(f"Team Player {slot}"), "Self")
-        # move_to = own position => zero desired velocity. Never sprint, never
-        # interact.
-        SoccerController(slot, here, Bool(False), Bool(False))
+    def spot(x, z):
+        return ScaleVector3(Vector3(Float(x), Float(0), Float(z)), side)
+
+    spawn_xz = [(30.0, 0.0), (34.0, -8.0), (34.0, 8.0), (38.0, 0.0)]
+    InitializeSoccer("Blank", "Poland", *[spot(x, z) for x, z in spawn_xz])
+
+    # Park on the LITERAL spawn coordinates. Feeding a player its own read-back
+    # position as MoveTo does NOT mean "stay put" — measured 2026-07-26, all
+    # four of these walked from their spawns to ~(0.5, 0) and clustered on the
+    # centre spot, which put the supposedly-inert control side right on top of
+    # the ball.
+    for slot, (px, pz) in zip((1, 2, 3, 4), spawn_xz):
+        SoccerController(slot, spot(px, pz), Bool(False), Bool(False))
 
     out = os.path.join(SOCCER_SAVES, "Blank.txt")
     os.makedirs(SOCCER_SAVES, exist_ok=True)
