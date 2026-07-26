@@ -23,14 +23,30 @@ def build_carrier_move(
 ):
     """AT picks safe+forward max-eval walk. If only back is safe (or none) → pass."""
     from titanium import anti_tackle, debug_viz, positioning
-    from titanium._env import WITH_ANTI_TACKLE
-
-    lane_ok, aim = clear_shot(me, opp_goal, opp_left_post, opp_right_post, opponents, r_eff)
-    ready = CompareFloats(charge, Float(FULL_CHARGE), ">=")
-    shoot_now = And(has_ball, And(lane_ok, ready))
+    from titanium._env import WITH_ANTI_TACKLE  # noqa: F401
 
     # Carrier stam for AT/ghost filter — Ball Carrier is authoritative while holding.
     my_stam = SoccerGetFloat("Ball Carrier Stamina")
+
+    # An aim direction is only real if the carrier can POINT that way and still
+    # have the ball: turning parks the held ball along the aim, so a lane that
+    # is geometrically open is worthless if a defender takes it the instant you
+    # face them. `aim_is_safe` hoists one blocked-arc per opponent, so each
+    # extra candidate costs a dot product and a compare rather than a re-solve.
+    #
+    # This does NOT stop us kicking toward their goal in general — only the
+    # specific angles a tackler already owns are removed. If the whole cone
+    # between the two post tangents is covered, the shot is correctly dropped
+    # and the carrier walks or passes instead.
+    aimable = anti_tackle.aim_is_safe(me, opponents, r_int, my_stam)
+
+    lane_ok, aim = clear_shot(
+        me, opp_goal, opp_left_post, opp_right_post, opponents, r_eff,
+        direction_ok=aimable,
+    )
+    ready = CompareFloats(charge, Float(FULL_CHARGE), ">=")
+    shoot_now = And(has_ball, And(lane_ok, ready))
+
     danger = And(
         has_ball,
         positioning.opponent_in_pass_danger(me, opponents, r_int, my_stam),

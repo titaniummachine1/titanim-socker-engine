@@ -20,7 +20,10 @@ def walk_target(me, desired, step=5.5):
     return me + direction * Float(step)
 
 
-def clear_shot(shot_origin, opp_goal, opp_left_post, opp_right_post, opponents, r_eff):
+def clear_shot(
+    shot_origin, opp_goal, opp_left_post, opp_right_post, opponents, r_eff,
+    direction_ok=None,
+):
     """Is there a legal straight-line lane into the enemy goal right now, and
     along which direction?
 
@@ -38,6 +41,13 @@ def clear_shot(shot_origin, opp_goal, opp_left_post, opp_right_post, opponents, 
     Centre is preferred whenever it is legal (largest margin for error); the
     tangents are the fallback for when somebody is standing in the middle.
 
+    `direction_ok` is an optional extra test applied per candidate. The
+    anti-tackle build passes one: aiming a direction turns the carrier, which
+    parks the held ball along that direction, so a lane that is geometrically
+    open is still worthless if the ball gets taken the moment you point at it.
+    Rejecting those here means the whole shot cone can be ruled out when every
+    angle between the two post tangents is covered by a tackler.
+
     Returns `(lane_open, aim_direction)`.
     """
     dir_c = unit_or_zero(opp_goal - shot_origin)
@@ -47,10 +57,16 @@ def clear_shot(shot_origin, opp_goal, opp_left_post, opp_right_post, opponents, 
         opponent_invariants(o, shot_origin, r_eff, opponent_half_angle(o, shot_origin, r_eff))
         for o in opponents
     ]
-    best = dir_c
-    ok = is_legal_direction(dir_c, invariants)
-    for cand in (dir_l, dir_r):
+    def viable(cand):
+        """Lane is clear AND — if a caller supplied one — the carrier can
+        actually aim this way. See `direction_ok` in the docstring."""
         legal = is_legal_direction(cand, invariants)
+        return legal if direction_ok is None else And(legal, direction_ok(cand))
+
+    best = dir_c
+    ok = viable(dir_c)
+    for cand in (dir_l, dir_r):
+        legal = viable(cand)
         take = And(legal, Not(ok))
         best = ConditionalSetVector3(take, cand, best)
         ok = Or(ok, legal)

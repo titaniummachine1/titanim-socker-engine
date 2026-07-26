@@ -96,6 +96,134 @@ def probe_walk_eval(me, me_end, ball_end, heading, opp_goal, clearance, danger):
     return progress * Float(2) + closer * Float(0.5) + face + margin * Float(0.25) - keep_pen
 
 
+@cache
+def hold_block_arc(me, opp, r_int, my_stam, opp_stam, hold=HOLD_OFFSET):
+    """The arc of aim directions this ONE opponent takes the ball on.
+
+    Turning to aim parks the held ball at `me_end + heading*hold`, so as the aim
+    sweeps, the ball traces a circle of radius `hold` around the carrier. The
+    directions that land it within `r_int` of the opponent are therefore an ARC,
+    centred on the direction to them, of half-width
+
+        acos( (hold^2 + d^2 - r_int^2) / (2*hold*d) )
+
+    That is the exact min/max angle a binary search converges toward, in one
+    `acos` instead of five probe evaluations — and it is a true bound rather
+    than the nearest of five samples.
+
+    Two cheap outcomes fall out of the same triangle and are what make this
+    worth doing at all:
+      * `d > hold + r_int`  -> the circle never reaches them, arc is EMPTY.
+        This is the bail: a distant opponent costs one compare, no trig.
+      * `d < r_int - hold`  -> the circle lies entirely inside their reach, so
+        EVERY direction is blocked.
+
+    Stamina gates it: an opponent who cannot win the duel (`opp_stam < my_stam`)
+    is a ghost and blocks nothing, matching `_can_tackle_us`.
+
+    Returns `(toward, cos_half, blocks_everything, blocks_nothing)`, shaped like
+    `geometry.opponent_invariants` so the per-candidate test stays a dot product.
+    """
+    opp_end = step_toward(opp, me, _WALK, _DT)
+    offset = opp_end - me
+    d = Magnitude(offset)
+    toward = unit_or_zero(offset)
+    h = Float(hold)
+
+    capable = _can_tackle_us(opp_stam, my_stam)
+    # Out of reach entirely — the ball circle never intersects their bubble.
+    out_of_range = CompareFloats(d, h + r_int, ">")
+    blocks_nothing = Or(Not(capable), out_of_range)
+    # Swallowed — every heading puts the ball inside their reach.
+    blocks_everything = And(capable, CompareFloats(d + h, r_int, "<="))
+
+    denom = MultiplyFloats(Float(2.0) * h, d)
+    safe_denom = ConditionalSetFloat(CompareFloats(denom, Float(1e-4), "<"), Float(1e-4), denom)
+    # Outside [-1,1] means the circles do not intersect; the two flags above
+    # already cover those cases, so the clamp only keeps the comparison sane.
+    # Native ClampFloat — one node instead of four.
+    cos_half = ClampFloat(
+        (h * h + d * d - MultiplyFloats(r_int, r_int)) / safe_denom,
+        Float(0) - Float(1),
+        Float(1),
+    )
+    return toward, cos_half, blocks_everything, blocks_nothing
+
+
+@cache
+def hold_direction_blocked(direction, arc):
+    """True if aiming `direction` puts the held ball in this opponent's reach.
+
+    `arc` is one `hold_block_arc` result. Inside the arc means the angle to
+    `toward` is smaller than the half-width, i.e. its cosine is LARGER than
+    `cos_half` — the same dot-product form `geometry.direction_forbidden` uses.
+    """
+    toward, cos_half, blocks_everything, blocks_nothing = arc
+    inside = CompareFloats(DotProduct(direction, toward), cos_half, ">=")
+    return And(Not(blocks_nothing), Or(blocks_everything, inside))
+
+
+def aim_is_safe(me, opponents, r_int, my_stam, hold=HOLD_OFFSET):
+    """Build a predicate: can the carrier aim `direction` and keep the ball?
+
+    Returned as a closure so `titanium.shot.clear_shot` / `clear_pass` can apply
+    it per candidate without importing anti-tackle. The per-opponent arcs are
+    hoisted here and shared across every candidate, so an extra aim direction
+    costs one dot product and one compare per opponent — not another solve.
+    """
+    staminas = opponent_staminas()
+    arcs = [
+        hold_block_arc(me, opp, r_int, my_stam, stam, hold)
+        for opp, stam in zip(opponents, staminas)
+    ]
+
+    def safe(direction):
+        blocked = Bool(False)
+        for arc in arcs:
+            blocked = Or(blocked, hold_direction_blocked(direction, arc))
+        return Not(blocked)
+
+    return safe
+
+
+def heading_safe(
+    me,
+    heading,
+    ball_start,
+    opponents,
+    staminas,
+    r_int,
+    team_goal,
+    my_stam,
+    opp_goal,
+    hold=HOLD_OFFSET,
+    move_step=5.5,
+):
+    """Can the ball be HELD along `heading` for one tick without being taken?
+
+    Turning to face a direction parks the held ball at `me_end + heading*hold`,
+    so this is the question "if I point that way, do I still have the ball at
+    the end of the tick". Used two ways: by `_probe` to score walk headings, and
+    by `titanium.carrier` to reject shot directions the carrier could not
+    actually aim along — see `titanium.shot.clear_shot`'s `direction_ok`.
+
+    Enemy net = the ball is already a goal and cannot be tackled, so it counts
+    safe. Own net is never safe, so no probe is tempted to place it there.
+    """
+    _me_end, ball_end = simulate_end_of_tick(me, heading, move_step, hold)
+    tackleable, _worst = _end_tick_tackleable(
+        ball_end, ball_start, opponents, staminas, r_int, me, my_stam
+    )
+    enemy_net = positioning.ball_in_goal_net(ball_end, opp_goal)
+    own_net = positioning.ball_in_goal_net(ball_end, team_goal)
+    own_goal_ok = And(
+        positioning.ball_clear_of_own_goal_plane(ball_end, team_goal),
+        Not(own_net),
+    )
+    tackle_threat = And(tackleable, Not(enemy_net))
+    return Or(enemy_net, And(Not(tackle_threat), own_goal_ok))
+
+
 def _probe(
     me,
     desired_dir,
@@ -116,16 +244,13 @@ def _probe(
     tackleable, worst_stam = _end_tick_tackleable(
         ball_end, ball_start, opponents, staminas, r_int, me, my_stam
     )
-    # Enemy net = goal already. Ball in goal cannot be tackled — force safe.
-    # Own net = never safe (void any "place it" temptation).
-    enemy_net = positioning.ball_in_goal_net(ball_end, opp_goal)
-    own_net = positioning.ball_in_goal_net(ball_end, team_goal)
-    own_goal_ok = And(
-        positioning.ball_clear_of_own_goal_plane(ball_end, team_goal),
-        Not(own_net),
+    safe = heading_safe(
+        me, heading, ball_start, opponents, staminas, r_int, team_goal, my_stam,
+        opp_goal, hold, move_step,
     )
-    tackle_threat = And(tackleable, Not(enemy_net))
-    safe = Or(enemy_net, And(Not(tackle_threat), own_goal_ok))
+    # Recomputed rather than returned from `heading_safe`: `ball_in_goal_net`
+    # is a cached graph function, so this is the same node, not a second one.
+    enemy_net = positioning.ball_in_goal_net(ball_end, opp_goal)
     # Forward = eval-up toward goal. Scoring into their net is always usable.
     progress = DotProduct(heading, unit_or_zero(opp_goal - me))
     forward = CompareFloats(progress, Float(0), ">=")
