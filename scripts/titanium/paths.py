@@ -15,9 +15,10 @@ SAVES = (
     / "Soccer"
     / "Titanium.txt"
 )
-# Built graph is also dropped into the public sim repo purely so the drill /
-# headless harnesses can load it. That path is gitignored there — the graph
-# is a build artifact, the source stays here.
+# Built graph is also dropped into the sim repo so the drill / headless
+# harnesses can load it. That path stays gitignored there for artifact hygiene,
+# not secrecy (both repos are public): a graph is 5-16 MB of JSON rewritten by
+# every build, so committing it is churn. The source lives here.
 LOCAL_OUT = ROOT.parents[0] / "aicomp-soccer-sim" / "data" / "titanium" / "Titanium.txt"
 # Every build lands here first. SAVES/LOCAL_OUT (the "live" submission copy
 # and the sim's gated-champion copy) are only touched by --promote, after a

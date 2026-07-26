@@ -6,12 +6,19 @@ goalkeeper, debug_viz, graph, deploy). This script just wires: build the
 graph, write it out, promote it if asked.
 
 CANONICAL LOCATION. This file is the competition engine and lives in the
-PRIVATE titanim-socker-engine repo. It must never be committed to
-aicomp-soccer-sim, which is a PUBLIC repo (that tree ignores it explicitly).
-Building writes the graph out to two places: the live Unity save folder, and
-the public sim's gitignored `data/titanium/` so the drill harnesses can load
-it via `--gk data/titanium/Titanium.txt` without the source ever going with
-it.
+titanim-socker-engine repo. Both repos are public now, so there is no secrecy
+rule here any more — but keep the two trees from bleeding into each other:
+
+  * ENGINE SOURCE lives here, and only here. Do not copy modules into
+    aicomp-soccer-sim; that repo is the simulator and its harnesses.
+  * BUILT GRAPHS are artifacts, not source. A single graph is 5-16 MB of JSON
+    and is rewritten by every build, so `data/titanium/` stays gitignored in
+    the sim tree and `out/ti_*.txt` stays gitignored here. Committing them is
+    churn, not history.
+
+Building writes the graph to the live Unity save folder and to the sim's
+`data/titanium/` so the drill harnesses can load it via
+`--gk data/titanium/Titanium.txt`.
 """
 from __future__ import annotations
 
