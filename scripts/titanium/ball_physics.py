@@ -300,8 +300,8 @@ def _clamp_axis(v, lo, hi):
     return ClampFloat(v, Float(lo), Float(hi))
 
 
-@graph_function("TiMeetPoint", ("Vector3", "Vector3", "Vector3", "Float"), "Vector3")
-def _meet_point(me, ball, ball_vel, speed):
+@cache
+def _meet_point(me, ball, ball_vel, speed):  # inlined: 116 evals vs 336 as a function
     """Where to walk to meet a moving ball, instead of its live position.
 
     Fixed-point pursuit solve (3 refinements): guess a travel time from the

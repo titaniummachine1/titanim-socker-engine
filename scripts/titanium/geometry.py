@@ -18,18 +18,25 @@ def pos(label: str):
 def _rotate_xz_body(v, angle):
     """Rotation maths as plain inlined nodes.
 
-    Separate from the `rotate_xz` graph function because a function body may not
-    call another function (`titanium.nodefn` rule 3) — `_post_tangent_parts`
-    needs the maths, not the call.
+    Kept separate from `rotate_xz` so `_post_tangent_parts` can inline the
+    maths directly rather than paying a second cache lookup for the same shape.
     """
     c = Cos(angle)
     s = Sin(angle)
     return Vector3(v.x * c - v.z * s, Float(0), v.x * s + v.z * c)
 
 
-@graph_function("TiRotateXZ", ("Vector3", "Float"), "Vector3")
+@cache
 def rotate_xz(v, angle):
-    """Rotate pitch vector around Y by `angle` radians (X/Z plane)."""
+    """Rotate pitch vector around Y by `angle` radians (X/Z plane).
+
+    Inlined, NOT a graph function. A body is emitted once but evaluated once per
+    CALL SITE, whereas an inlined construct is shared by `@cache`, so common
+    subexpressions across instances collapse into one node that runs once.
+    Measured on the anti-tackle build: 159 evaluations inlined, 200 as a
+    function. Every node runs every tick, so evaluations are the real cost —
+    stored node count is only file size.
+    """
     return _rotate_xz_body(v, angle)
 
 
@@ -122,12 +129,11 @@ def post_tangent(origin, post_center, contact_r):
 
 
 def _post_tangent_parts(origin, post_center, contact_r):
-    """Shared maths for the two post-tangent functions below.
+    """Shared maths for the two post-tangent entry points below.
 
-    Split into a `_dir` and a `_point` function because a graph function returns
-    exactly one value. That split is free in a shipped build: only `debug_viz`
-    ever wants the tangent POINT, and release strips it, so
-    `TiPostTangentPoint` is simply never emitted.
+    Split into `_dir` and `_point` so a caller pays only for the half it wants:
+    release strips `debug_viz`, which is the only consumer of the tangent POINT,
+    so that half then costs nothing at all.
     """
     offset = post_center - origin
     dist = Magnitude(offset)
@@ -144,13 +150,20 @@ def _post_tangent_parts(origin, post_center, contact_r):
     return inward_is_a, cand_a, cand_b, point_a, point_b
 
 
-@graph_function("TiPostTangentDir", ("Vector3", "Vector3", "Float"), "Vector3")
+@cache
 def post_tangent_dir(origin, post_center, contact_r):
+    """Inlined, NOT a graph function — by far the worst trade of the lot.
+
+    18 call sites x a 44-node body = 792 evaluations per tick as a function,
+    against 236 inlined, because `@cache` merges the shared origin/post
+    subexpressions between call sites and a function body cannot. It stored 174
+    fewer nodes and cost 556 more evaluations to do it.
+    """
     inward, cand_a, cand_b, _pa, _pb = _post_tangent_parts(origin, post_center, contact_r)
     return ConditionalSetVector3(inward, cand_a, cand_b)
 
 
-@graph_function("TiPostTangentPoint", ("Vector3", "Vector3", "Float"), "Vector3")
+@cache
 def post_tangent_point(origin, post_center, contact_r):
     inward, _a, _b, point_a, point_b = _post_tangent_parts(origin, post_center, contact_r)
     return ConditionalSetVector3(inward, point_a, point_b)

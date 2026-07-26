@@ -44,8 +44,8 @@ def _clamp_axis(v, lo, hi):
     return ClampFloat(v, lo, hi)
 
 
-@graph_function("TiClampHold", ("Vector3",), "Vector3")
-def clamp_hold_to_playable(hold):
+@cache
+def clamp_hold_to_playable(hold):  # inlined: 100 evals vs 140 as a function
     """Project held-ball center into playable AABB — matches sim
     `project_hold_into_playable`: Z always clamped; X clamped only outside
     the goal mouth so walk-in goals stay possible and wall-rub compresses
@@ -77,8 +77,8 @@ def simulate_walk_end(me, move_target):
     return step_toward(me, move_target, _WALK, _DT)
 
 
-@graph_function("TiBallClearOfGoalPlane", ("Vector3", "Vector3"), "Bool")
-def ball_clear_of_own_goal_plane(ball_end, team_goal, clearance=_CLEAR):
+@cache
+def ball_clear_of_own_goal_plane(ball_end, team_goal, clearance=_CLEAR):  # inlined: 61 vs 160
     """True if held ball stays on the pitch side of our goal plane.
 
     Own-goal risk: anti-tackle rotates the hold offset and can put the ball
@@ -90,8 +90,8 @@ def ball_clear_of_own_goal_plane(ball_end, team_goal, clearance=_CLEAR):
     return ConditionalSetBool(defends_neg, ok_west, ok_east)
 
 
-@graph_function("TiBallInGoalNet", ("Vector3", "Vector3"), "Bool")
-def ball_in_goal_net(ball_end, goal):
+@cache
+def ball_in_goal_net(ball_end, goal):  # inlined: 224 evals vs 360 as a function
     """True if ball center is past `goal`'s line inside the mouth (sim `goal_at`).
 
     Held or free — once the ball is in the net it is a goal; it cannot be
