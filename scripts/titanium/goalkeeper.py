@@ -212,10 +212,8 @@ def gk_policy(
     clear_spot = walk_target(gk, clear_target, step=14)
     move = ConditionalSetVector3(has_ball, clear_spot, cover)
 
-    # Sprint ONLY to intercept a free ball whose predicted path crosses our
-    # own goal line — and only when walking can't already get there in time.
-    # Gated on `loose`: held-ball "Ball Velocity" is the offset point, not
-    # the carrier, and spinning opponents were fabricating fake threats.
+    # Sprint to intercept a free ball whose predicted path crosses our net —
+    # if walking cannot arrive in time. Panic: still sprint even when late.
     goal_half_width_est = Abs(left_post.z)
     is_threat_raw, threat_time, threat_point = own_goal_threat(
         ball, ball_vel, team_goal.x, goal_half_width_est
@@ -223,10 +221,8 @@ def gk_policy(
     is_threat = And(is_threat_raw, loose)
     dist_gk_threat = Distance(gk, threat_point)
     walk_time_threat = dist_gk_threat / Float(WALK_SPEED)
-    sprint_time_threat = dist_gk_threat / Float(SPRINT_SPEED)
     walk_cant_make_it = CompareFloats(walk_time_threat, threat_time, ">")
-    sprint_can_make_it = CompareFloats(sprint_time_threat, threat_time, "<=")
-    sprint = And(is_threat, And(walk_cant_make_it, sprint_can_make_it))
+    sprint = And(is_threat, walk_cant_make_it)
 
     # Opponent holds the ball: charge-aware press from the carrier BODY
     # (never the held-ball offset — spin would yank the target around),
@@ -241,11 +237,12 @@ def gk_policy(
     )
     move = ConditionalSetVector3(opp_has, press, move)
 
-    # A genuine goal-bound threat overrides the opponent-press branch above —
-    # this must run LAST. Once `is_threat` is true the carrier reference is
-    # stale anyway (they no longer have the ball), so a real threat should
-    # always win regardless of what `opp_has` says this tick.
-    move = ConditionalSetVector3(is_threat, threat_point, move)
+    # Net-bound threat: chase the predicted path at sprint when needed —
+    # do not fall back to live-ball pursuit that bleeds ground.
+    meet_point_gk = predict_ball_meet_point(gk, ball, ball_vel, WALK_SPEED)
+    meet_point_gk_sprint = predict_ball_meet_point(gk, ball, ball_vel, SPRINT_SPEED)
+    threat_chase = ConditionalSetVector3(sprint, meet_point_gk_sprint, threat_point)
+    move = ConditionalSetVector3(is_threat, threat_chase, move)
 
     debug = {"is_threat": is_threat, "threat_point": threat_point, "opp_has": opp_has, "press": press, "move": move}
 
@@ -259,12 +256,13 @@ def gk_policy(
     # keeps the raw ball position.
     nearby = SoccerGetBool("Is Ball Nearby Team Player 4")
     closest_gk = SoccerGetBool("Is Team Player 4 Closest Teammate to Ball")
-    meet_point_gk = predict_ball_meet_point(gk, ball, ball_vel, WALK_SPEED)
     chase_target_gk = ConditionalSetVector3(nearby, ball, meet_point_gk)
     go_to_ball = Or(And(loose, closest_gk), And(nearby, Not(has_ball)))
     chase_ok = Or(nearby, seals(gk))
-    move = ConditionalSetVector3(And(go_to_ball, chase_ok), chase_target_gk, move)
-    move = ConditionalSetVector3(And(nearby, Not(has_ball)), ball, move)
+    # Threat already owns the move; don't let ordinary chase override panic.
+    ordinary_chase = And(And(go_to_ball, chase_ok), Not(is_threat))
+    move = ConditionalSetVector3(ordinary_chase, chase_target_gk, move)
+    move = ConditionalSetVector3(And(And(nearby, Not(has_ball)), Not(is_threat)), ball, move)
 
     # The keeper never crosses midfield, however tempting the press or a
     # loose ball upfield looks — being beaten past the halfway line leaves an

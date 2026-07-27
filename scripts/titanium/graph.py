@@ -279,7 +279,7 @@ def build() -> None:
         is_press = CompareFloats(Distance(all_bodies[i], press_body), Float(0.4), "<")
         emergency = Or(
             And(walk_in_threat, Or(duty_flags[i], is_press)),
-            And(net_shot_threat, closest_flags[i]),
+            net_shot_threat,  # whole team panics on net-bound flying ball
         )
         move_pris.append(
             positioning.task_value(
@@ -374,20 +374,16 @@ def build() -> None:
             i_am_steal,
         )
 
-        # Loose ball: meet at walk speed by default. Sprint is gated below —
-        # only when it is the difference between conceding and not.
+        # Loose / flying ball.
+        # Panic: predicted path crosses OUR net → everyone intercepts; sprint
+        # if walking cannot arrive before the crossing (even if sprint is also
+        # late — still run). Normal loose: only closest claims at walk speed.
         meet_point_walk = predict_ball_meet_point(me, ball, ball_vel, WALK_SPEED)
         meet_point_sprint = predict_ball_meet_point(me, ball, ball_vel, SPRINT_SPEED)
-        # Sprint ONLY if walking cannot stop the ball entering OUR net and
-        # sprinting can. Two cases: goal-bound loose shot, or open walk-in.
         d_shot = Distance(me, shot_threat_pt)
-        sprint_save_shot = And(
-            net_shot_threat,
-            And(
-                CompareFloats(d_shot / Float(WALK_SPEED), shot_threat_t, ">"),
-                CompareFloats(d_shot / Float(SPRINT_SPEED), shot_threat_t, "<="),
-            ),
-        )
+        walk_beats_shot = CompareFloats(d_shot / Float(WALK_SPEED), shot_threat_t, "<=")
+        # Sprint whenever walk loses the race to a net-bound ball.
+        sprint_save_shot = And(net_shot_threat, Not(walk_beats_shot))
         d_ball = Distance(me, ball)
         sprint_save_walkin = And(
             walk_in_threat,
@@ -400,7 +396,9 @@ def build() -> None:
         loose_target = ConditionalSetVector3(
             sprint_save_shot, meet_point_sprint, meet_point_walk
         )
-        move = ConditionalSetVector3(And(loose, closest), loose_target, move)
+        # Net-bound flying ball: all outfielders panic-chase (not only closest).
+        claim_loose = Or(closest, net_shot_threat)
+        move = ConditionalSetVector3(And(loose, claim_loose), loose_target, move)
         debug_viz.plot_xz(f"Titanium.P{slot}.Pos", "Cyan", me)
         debug_viz.plot_xz(f"Titanium.P{slot}.Target", "Yellow", move)
         debug_viz.draw_player_move(me, move)
@@ -430,10 +428,8 @@ def build() -> None:
         carrier_charge,
     )
     debug_viz.draw_gk_branches(gk_debug)
-    # Loose ball: go to ball only if closest teammate; sprint already gated
-    # inside gk_policy (goal-bound-shot walk-vs-sprint check).
-    closest4 = SoccerGetBool("Is Team Player 4 Closest Teammate to Ball")
-    move4 = ConditionalSetVector3(And(loose, closest4), ball, move4)
+    # gk_policy already owns loose claim + net-bound panic (meet-point chase).
+    # Do not override with live ball position — that turns saves into pure pursuit.
     debug_viz.plot_xz("Titanium.P4.Pos", "Cyan", p4)
     debug_viz.plot_xz("Titanium.P4.Target", "Yellow", move4)
     debug_viz.draw_player_move(p4, move4)
