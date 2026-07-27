@@ -158,6 +158,76 @@ def push_apart_from(anchor, point, min_sep):
     return ConditionalSetVector3(too_close, pushed, point)
 
 
+def movement_priority(
+    has_ball,
+    team_has,
+    opp_has,
+    loose,
+    closest_to_ball,
+    duty,
+    is_press_body,
+):
+    """Task-urgency score for soft anti-clump preference (higher keeps station)."""
+    from titanium.constants import (
+        PRI_CARRIER,
+        PRI_LOOSE_CLAIM,
+        PRI_PRESS_TACKLE,
+        PRI_SUPPORT,
+        PRI_THREAT_COVER,
+    )
+
+    p = Float(PRI_THREAT_COVER)
+    p = ConditionalSetFloat(And(team_has, Not(has_ball)), Float(PRI_SUPPORT), p)
+    p = ConditionalSetFloat(And(opp_has, Or(duty, is_press_body)), Float(PRI_PRESS_TACKLE), p)
+    p = ConditionalSetFloat(And(loose, closest_to_ball), Float(PRI_LOOSE_CLAIM), p)
+    p = ConditionalSetFloat(has_ball, Float(PRI_CARRIER), p)
+    return p
+
+
+def clamp_by_priority(
+    me,
+    support_target,
+    peer_bodies,
+    peer_priorities,
+    my_priority,
+    r_int,
+    ball=None,
+    opp_goal=None,
+    carrier_retreating=None,
+):
+    """Soft preference: don't clump on a higher-urgency teammate's station.
+
+    Not hard collision avoidance — bodies can still overlap briefly. Lower
+    urgency prefers to spread; higher urgency keeps its target. Near-equal
+    priorities both ease apart a little.
+    """
+    from titanium.constants import PRI_EQUAL_BAND, PRI_EQUAL_YIELD_FRAC
+
+    min_sep = teammate_min_separation(r_int)
+    soft_sep = min_sep * Float(PRI_EQUAL_YIELD_FRAC)
+    band = Float(PRI_EQUAL_BAND)
+    target = support_target
+
+    for peer, their_pri in zip(peer_bodies, peer_priorities):
+        me_end = simulate_walk_end(me, target)
+        clumped = CompareFloats(Distance(me_end, peer), min_sep, "<")
+        lower = CompareFloats(my_priority + band, their_pri, "<")
+        near_eq = CompareFloats(Abs(my_priority - their_pri), band, "<=")
+        full = push_apart_from(peer, me_end, min_sep)
+        soft = push_apart_from(peer, me_end, soft_sep)
+        after_eq = ConditionalSetVector3(And(clumped, near_eq), soft, target)
+        target = ConditionalSetVector3(And(clumped, lower), full, after_eq)
+
+    if ball is not None and opp_goal is not None and carrier_retreating is not None:
+        attack_east = CompareFloats(opp_goal.x, Float(0), ">")
+        past_east = CompareFloats(target.x, ball.x, ">")
+        past_west = CompareFloats(target.x, ball.x, "<")
+        past_ball = ConditionalSetBool(attack_east, past_east, past_west)
+        capped = Vector3(ball.x, target.y, target.z)
+        target = ConditionalSetVector3(And(carrier_retreating, past_ball), capped, target)
+    return target
+
+
 def clamp_support_station(
     me,
     support_target,
@@ -167,16 +237,26 @@ def clamp_support_station(
     ball=None,
     opp_goal=None,
     carrier_retreating=None,
+    my_priority=None,
+    peer_priorities=None,
 ):
-    """Helper yields: end-of-tick stay ≥ r_int+hold from each anchor.
+    """Anti-clump spacing. Prefer soft task-urgency yield when priorities given.
 
-    `priority_anchor` (carrier / current sacrifice / attacker) is applied
-    first — helpers move out of their way; the priority body is never pushed.
-
-    When `carrier_retreating` and ball/opp_goal are set: do not push a helper
-    further toward the enemy goal than the ball — clearing the carrier's path
-    must not park outlets ahead of a backing ball.
+    Legacy path (no priorities): yield from every anchor, `priority_anchor` first.
     """
+    if my_priority is not None and peer_priorities is not None:
+        return clamp_by_priority(
+            me,
+            support_target,
+            anchors,
+            peer_priorities,
+            my_priority,
+            r_int,
+            ball=ball,
+            opp_goal=opp_goal,
+            carrier_retreating=carrier_retreating,
+        )
+
     min_sep = teammate_min_separation(r_int)
     target = support_target
     ordered = list(anchors)

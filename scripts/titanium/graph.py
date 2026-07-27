@@ -156,11 +156,17 @@ def build() -> None:
     h1 = SoccerGetBool("Team Player 1 Has Ball")
     h2 = SoccerGetBool("Team Player 2 Has Ball")
     h3 = SoccerGetBool("Team Player 3 Has Ball")
+    h4_early = SoccerGetBool("Team Player 4 Has Ball")
     carrier = ConditionalSetVector3(
         h1, p1, ConditionalSetVector3(h2, p2, ConditionalSetVector3(h3, p3, p4))
     )
 
     outfield = [p1, p2, p3]
+    all_bodies = [p1, p2, p3, p4]
+    has_flags = [h1, h2, h3, h4_early]
+    closest_flags = [
+        SoccerGetBool(f"Is Team Player {i} Closest Teammate to Ball") for i in range(1, 5)
+    ]
     carrier_stam = SoccerGetFloat("Ball Carrier Stamina")
     carrier_charge = SoccerGetFloat("Ball Carrier Shot Charge")
 
@@ -266,6 +272,22 @@ def build() -> None:
     # Tackle assignment once for the whole team (not once per outfielder).
     duty_flags, chaser_flags, press_body = tackle_plan()
 
+    # Soft anti-clump preference scores (who spreads when stations overlap).
+    move_pris = []
+    for i in range(4):
+        is_press = CompareFloats(Distance(all_bodies[i], press_body), Float(0.4), "<")
+        move_pris.append(
+            positioning.movement_priority(
+                has_flags[i],
+                team_has,
+                opp_has,
+                loose,
+                closest_flags[i],
+                duty_flags[i],
+                is_press,
+            )
+        )
+
     for slot, me, marks, raw in (
         (1, p1, opponents[0], raw_support[0]),
         (2, p2, opponents[1], raw_support[1]),
@@ -304,26 +326,31 @@ def build() -> None:
             )
         # Defensive default: seal our assigned opponent's shot cone.
         move = threat_cover(marks, team_goal, left_post, right_post, r_int)
-        # Opponent carrier: interceptors chase. Presser (sacrifice/stealer) goes
-        # straight to the ball; other chasers yield ≥ r_int+hold so they cannot
-        # accidentally tackle-range the presser if the ball is aimed at them.
+        # Opponent carrier: interceptors chase. Higher-urgency press keeps
+        # station; other chasers prefer to spread so they don't clump on him.
         duty = duty_flags[slot - 1]
         tackle_chase = chaser_flags[slot - 1]
-        mate_anchors = [p for i, p in enumerate(outfield) if i != (slot - 1)]
+        my_pri = move_pris[slot - 1]
+        peer_bodies = [all_bodies[i] for i in range(4) if i != (slot - 1)]
+        peer_pris = [move_pris[i] for i in range(4) if i != (slot - 1)]
         yield_chase = positioning.clamp_support_station(
-            me, ball, mate_anchors, r_int, priority_anchor=press_body
+            me,
+            ball,
+            peer_bodies,
+            r_int,
+            my_priority=my_pri,
+            peer_priorities=peer_pris,
         )
         chase_move = ConditionalSetVector3(duty, ball, yield_chase)
         move = ConditionalSetVector3(And(opp_has, tackle_chase), chase_move, move)
-        # Attacking: helpers clear ≥ r_int+hold from carrier (priority) + mates.
-        # When the carrier is backing toward our goal, do not shove helpers
-        # further toward the enemy goal than the ball.
+        # Attacking: soft preference vs carrier / mates (don't clump on outlets).
         support = positioning.clamp_support_station(
             me,
             raw,
-            mate_anchors,
+            peer_bodies,
             r_int,
-            priority_anchor=carrier,
+            my_priority=my_pri,
+            peer_priorities=peer_pris,
             ball=ball,
             opp_goal=opp_goal,
             carrier_retreating=carrier_urgent,

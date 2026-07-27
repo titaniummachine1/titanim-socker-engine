@@ -84,6 +84,16 @@ KEEP_BALL_DANGER_PENALTY = 2.0
 # Anti-tackle: attacker cannot walk forward toward the enemy goal (now, or
 # predicted after this tick finalizes) → treat as catastrophic eval / pass now.
 AT_NO_FORWARD_PENALTY = 10.0
+# Soft anti-clump preference (not hard collision). Higher task urgency keeps
+# its station; lower prefers to spread. Near-equal → both ease apart a bit.
+PRI_CARRIER = 100.0
+PRI_LOOSE_CLAIM = 90.0
+PRI_PRESS_TACKLE = 80.0
+PRI_THREAT_COVER = 70.0
+PRI_SUPPORT = 50.0
+PRI_REPOSITION = 20.0
+PRI_EQUAL_BAND = 5.0
+PRI_EQUAL_YIELD_FRAC = 0.55
 # Playable AABB — matches aicomp-soccer-sim SimParams fallback / Unity pitch.
 # Held-ball offset is projected into this region (sidelines always; endlines
 # only outside the goal mouth) exactly like `project_hold_into_playable`.
