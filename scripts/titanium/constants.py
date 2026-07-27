@@ -84,16 +84,19 @@ KEEP_BALL_DANGER_PENALTY = 2.0
 # Anti-tackle: attacker cannot walk forward toward the enemy goal (now, or
 # predicted after this tick finalizes) → treat as catastrophic eval / pass now.
 AT_NO_FORWARD_PENALTY = 10.0
-# Soft anti-clump preference (not hard collision). Higher task urgency keeps
-# its station; lower prefers to spread. Near-equal → both ease apart a bit.
+# Soft space-claim utility (no player-player physics). Task value decides who
+# keeps a contested station; lower value shifts mildly. Not collision avoidance.
 PRI_CARRIER = 100.0
 PRI_LOOSE_CLAIM = 90.0
-PRI_PRESS_TACKLE = 80.0
-PRI_THREAT_COVER = 70.0
-PRI_SUPPORT = 50.0
+PRI_PRESS_TACKLE = 90.0  # intercept / tackle window
+PRI_THREAT_COVER = 30.0  # shot-angle seal — yields to intercept
+PRI_SUPPORT = 40.0
 PRI_REPOSITION = 20.0
-PRI_EQUAL_BAND = 5.0
-PRI_EQUAL_YIELD_FRAC = 0.55
+PRI_VALUE_BAND = 5.0  # within this → mild mutual spread only
+# Formation heuristic gap = r_int + HOLD_OFFSET (preferred_spacing).
+MILD_SPREAD_FRAC = 0.35  # equal-role overlap: gentle unclump
+ROLE_SHIFT_FRAC = 1.0  # clearly lower value: shift out to full preferred gap
+COLLAPSE_SPACING_FRAC = 0.25  # emergency handoff: support may close on carrier
 # Playable AABB — matches aicomp-soccer-sim SimParams fallback / Unity pitch.
 # Held-ball offset is projected into this region (sidelines always; endlines
 # only outside the goal mouth) exactly like `project_hold_into_playable`.

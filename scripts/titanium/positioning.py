@@ -132,21 +132,21 @@ def opponent_in_pass_danger(me, opponents, r_int, my_stam=None, opp_staminas=Non
     return flagged
 
 
-def teammate_min_separation(r_int):
-    """Min body-body gap so a mate cannot tackle our held ball.
+def preferred_spacing(r_int):
+    """Formation heuristic gap between role stations (not a physics constraint).
 
-    Worst case: carrier aims the hold offset straight at the teammate, so the
-    ball sits `HOLD_OFFSET` closer than the bodies. Interact needs `r_int` to
-    the ball ⇒ bodies must stay at least `r_int + HOLD_OFFSET` apart.
+    Uses r_int + HOLD_OFFSET as a convenient pitch-scale preferred distance —
+    historically the held-ball steal radius; here it only means "don't park
+    two roles on top of each other."
     """
     return r_int + Float(HOLD_OFFSET)
 
 
-def push_apart_from(anchor, point, min_sep):
-    """If `point` is closer than min_sep to `anchor`, push it out along the line."""
+def reduce_role_overlap(anchor, point, spacing):
+    """Nudge `point` out to `spacing` from `anchor` when overlapping."""
     delta = point - anchor
     dist = Magnitude(delta)
-    too_close = CompareFloats(dist, min_sep, "<")
+    too_close = CompareFloats(dist, spacing, "<")
     safe_dir = unit_or_zero(
         ConditionalSetVector3(
             CompareFloats(dist, Float(1e-4), "<"),
@@ -154,11 +154,16 @@ def push_apart_from(anchor, point, min_sep):
             delta,
         )
     )
-    pushed = anchor + safe_dir * min_sep
-    return ConditionalSetVector3(too_close, pushed, point)
+    shifted = anchor + safe_dir * spacing
+    return ConditionalSetVector3(too_close, shifted, point)
 
 
-def movement_priority(
+# Back-compat aliases (old collision-flavoured names).
+teammate_min_separation = preferred_spacing
+push_apart_from = reduce_role_overlap
+
+
+def task_value(
     has_ball,
     team_has,
     opp_has,
@@ -167,7 +172,7 @@ def movement_priority(
     duty,
     is_press_body,
 ):
-    """Task-urgency score for soft anti-clump preference (higher keeps station)."""
+    """Expected tactical value of this player's current task (higher keeps space)."""
     from titanium.constants import (
         PRI_CARRIER,
         PRI_LOOSE_CLAIM,
@@ -184,39 +189,100 @@ def movement_priority(
     return p
 
 
-def clamp_by_priority(
+movement_priority = task_value  # alias
+
+
+def resolve_space_claims(
     me,
-    support_target,
+    desired_target,
     peer_bodies,
-    peer_priorities,
-    my_priority,
+    peer_values,
+    my_value,
     r_int,
     ball=None,
     opp_goal=None,
     carrier_retreating=None,
+    collapse_ok=None,
 ):
-    """Soft preference: don't clump on a higher-urgency teammate's station.
+    """Soft utility resolver for overlapping role stations.
 
-    Not hard collision avoidance — bodies can still overlap briefly. Lower
-    urgency prefers to spread; higher urgency keeps its target. Near-equal
-    priorities both ease apart a little.
+    desired tactical positions + soft overlap penalty + priority-weighted
+    conflict resolution. No player-player collision model.
+
+    if my_value clearly lower: shift to preferred_spacing (or collapse gap
+    toward carrier when collapse_ok — emergency handoff).
+    if near-equal: mild spread only.
+    if higher: keep desired_target.
     """
-    from titanium.constants import PRI_EQUAL_BAND, PRI_EQUAL_YIELD_FRAC
+    from titanium.constants import (
+        COLLAPSE_SPACING_FRAC,
+        MILD_SPREAD_FRAC,
+        PRI_CARRIER,
+        PRI_VALUE_BAND,
+        ROLE_SHIFT_FRAC,
+    )
 
-    min_sep = teammate_min_separation(r_int)
-    soft_sep = min_sep * Float(PRI_EQUAL_YIELD_FRAC)
-    band = Float(PRI_EQUAL_BAND)
-    target = support_target
+    pref = preferred_spacing(r_int)
+    mild = pref * Float(MILD_SPREAD_FRAC)
+    shift = pref * Float(ROLE_SHIFT_FRAC)
+    collapse = pref * Float(COLLAPSE_SPACING_FRAC)
+    band = Float(PRI_VALUE_BAND)
+    carrier_v = Float(PRI_CARRIER)
+    if collapse_ok is None:
+        collapse_ok = Bool(False)
+    target = desired_target
 
-    for peer, their_pri in zip(peer_bodies, peer_priorities):
+    for peer, their_v in zip(peer_bodies, peer_values):
         me_end = simulate_walk_end(me, target)
-        clumped = CompareFloats(Distance(me_end, peer), min_sep, "<")
-        lower = CompareFloats(my_priority + band, their_pri, "<")
-        near_eq = CompareFloats(Abs(my_priority - their_pri), band, "<=")
-        full = push_apart_from(peer, me_end, min_sep)
-        soft = push_apart_from(peer, me_end, soft_sep)
-        after_eq = ConditionalSetVector3(And(clumped, near_eq), soft, target)
-        target = ConditionalSetVector3(And(clumped, lower), full, after_eq)
+        lower = CompareFloats(my_value + band, their_v, "<")
+        near_eq = CompareFloats(Abs(my_value - their_v), band, "<=")
+        vs_carrier = CompareFloats(their_v, carrier_v - band, ">=")
+        # Emergency: support may collapse toward carrier for a handoff.
+        lower_gap = ConditionalSetFloat(
+            And(collapse_ok, vs_carrier), collapse, shift
+        )
+        after_eq = ConditionalSetVector3(
+            And(near_eq, CompareFloats(Distance(me_end, peer), mild, "<")),
+            reduce_role_overlap(peer, me_end, mild),
+            target,
+        )
+        target = ConditionalSetVector3(
+            And(lower, CompareFloats(Distance(me_end, peer), lower_gap, "<")),
+            reduce_role_overlap(peer, me_end, lower_gap),
+            after_eq,
+        )
+
+    if ball is not None and opp_goal is not None and carrier_retreating is not None:
+        attack_east = CompareFloats(opp_goal.x, Float(0), ">")
+        past_east = CompareFloats(target.x, ball.x, ">")
+        past_west = CompareFloats(target.x, ball.x, "<")
+        past_ball = ConditionalSetBool(attack_east, past_east, past_west)
+        capped = Vector3(ball.x, target.y, target.z)
+        target = ConditionalSetVector3(And(carrier_retreating, past_ball), capped, target)
+    return target
+
+
+def resolve_space_claims_legacy(
+    me,
+    desired_target,
+    anchors,
+    r_int,
+    priority_anchor=None,
+    ball=None,
+    opp_goal=None,
+    carrier_retreating=None,
+):
+    """Legacy: treat every anchor as higher-value; shift off all of them."""
+    pref = preferred_spacing(r_int)
+    target = desired_target
+    ordered = list(anchors)
+    if priority_anchor is not None:
+        ordered = [priority_anchor] + ordered
+    for anchor in ordered:
+        me_end = simulate_walk_end(me, target)
+        need = CompareFloats(Distance(me_end, anchor), pref, "<")
+        shifted = reduce_role_overlap(anchor, me_end, pref)
+        target = ConditionalSetVector3(need, shifted, target)
 
     if ball is not None and opp_goal is not None and carrier_retreating is not None:
         attack_east = CompareFloats(opp_goal.x, Float(0), ">")
@@ -239,13 +305,11 @@ def clamp_support_station(
     carrier_retreating=None,
     my_priority=None,
     peer_priorities=None,
+    collapse_ok=None,
 ):
-    """Anti-clump spacing. Prefer soft task-urgency yield when priorities given.
-
-    Legacy path (no priorities): yield from every anchor, `priority_anchor` first.
-    """
+    """Compatibility wrapper → resolve_space_claims / legacy."""
     if my_priority is not None and peer_priorities is not None:
-        return clamp_by_priority(
+        return resolve_space_claims(
             me,
             support_target,
             anchors,
@@ -255,26 +319,15 @@ def clamp_support_station(
             ball=ball,
             opp_goal=opp_goal,
             carrier_retreating=carrier_retreating,
+            collapse_ok=collapse_ok,
         )
-
-    min_sep = teammate_min_separation(r_int)
-    target = support_target
-    ordered = list(anchors)
-    if priority_anchor is not None:
-        ordered = [priority_anchor] + ordered
-    for anchor in ordered:
-        me_end = simulate_walk_end(me, target)
-        need_push = CompareFloats(Distance(me_end, anchor), min_sep, "<")
-        pushed = push_apart_from(anchor, me_end, min_sep)
-        target = ConditionalSetVector3(need_push, pushed, target)
-
-    if ball is not None and opp_goal is not None and carrier_retreating is not None:
-        # Attack east when opp_goal.x > 0.
-        attack_east = CompareFloats(opp_goal.x, Float(0), ">")
-        past_east = CompareFloats(target.x, ball.x, ">")
-        past_west = CompareFloats(target.x, ball.x, "<")
-        past_ball = ConditionalSetBool(attack_east, past_east, past_west)
-        # Pull helper back onto the ball's goal-line X; keep their lateral Z.
-        capped = Vector3(ball.x, target.y, target.z)
-        target = ConditionalSetVector3(And(carrier_retreating, past_ball), capped, target)
-    return target
+    return resolve_space_claims_legacy(
+        me,
+        support_target,
+        anchors,
+        r_int,
+        priority_anchor=priority_anchor,
+        ball=ball,
+        opp_goal=opp_goal,
+        carrier_retreating=carrier_retreating,
+    )

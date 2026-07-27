@@ -272,12 +272,12 @@ def build() -> None:
     # Tackle assignment once for the whole team (not once per outfielder).
     duty_flags, chaser_flags, press_body = tackle_plan()
 
-    # Soft anti-clump preference scores (who spreads when stations overlap).
+    # Soft space-claim values (who keeps a contested station).
     move_pris = []
     for i in range(4):
         is_press = CompareFloats(Distance(all_bodies[i], press_body), Float(0.4), "<")
         move_pris.append(
-            positioning.movement_priority(
+            positioning.task_value(
                 has_flags[i],
                 team_has,
                 opp_has,
@@ -326,34 +326,37 @@ def build() -> None:
             )
         # Defensive default: seal our assigned opponent's shot cone.
         move = threat_cover(marks, team_goal, left_post, right_post, r_int)
-        # Opponent carrier: interceptors chase. Higher-urgency press keeps
-        # station; other chasers prefer to spread so they don't clump on him.
+        # Opponent carrier: interceptors chase. Higher-value press keeps route;
+        # cover / other chasers shift if they claim the same space.
         duty = duty_flags[slot - 1]
         tackle_chase = chaser_flags[slot - 1]
         my_pri = move_pris[slot - 1]
         peer_bodies = [all_bodies[i] for i in range(4) if i != (slot - 1)]
         peer_pris = [move_pris[i] for i in range(4) if i != (slot - 1)]
-        yield_chase = positioning.clamp_support_station(
-            me,
-            ball,
-            peer_bodies,
-            r_int,
-            my_priority=my_pri,
-            peer_priorities=peer_pris,
+        # Cover also soft-resolves vs press so shot-angle doesn't sit on the
+        # intercept route (utility, not collision).
+        cover_resolved = positioning.resolve_space_claims(
+            me, move, peer_bodies, peer_pris, my_pri, r_int
+        )
+        move = ConditionalSetVector3(opp_has, cover_resolved, move)
+        yield_chase = positioning.resolve_space_claims(
+            me, ball, peer_bodies, peer_pris, my_pri, r_int
         )
         chase_move = ConditionalSetVector3(duty, ball, yield_chase)
         move = ConditionalSetVector3(And(opp_has, tackle_chase), chase_move, move)
-        # Attacking: soft preference vs carrier / mates (don't clump on outlets).
-        support = positioning.clamp_support_station(
+        # Attacking outlets: mild equal-role spread; collapse toward carrier
+        # when AT demands an emergency handoff.
+        support = positioning.resolve_space_claims(
             me,
             raw,
             peer_bodies,
+            peer_pris,
+            my_pri,
             r_int,
-            my_priority=my_pri,
-            peer_priorities=peer_pris,
             ball=ball,
             opp_goal=opp_goal,
             carrier_retreating=carrier_urgent,
+            collapse_ok=carrier_urgent,
         )
         move = ConditionalSetVector3(And(team_has, Not(has)), support, move)
         move = ConditionalSetVector3(has, carry, move)
