@@ -12,6 +12,21 @@ from titanium.geometry import unit_or_zero
 from titanium.shot import clear_pass
 
 
+def lower_density_flank_z(opponents):
+    """Return +1/-1 for the less occupied pitch flank, or 0 on a tie."""
+    pos_z = Float(0)
+    neg_z = Float(0)
+    for opp in opponents:
+        on_pos_z = CompareFloats(opp.z, Float(0), ">")
+        pos_z = pos_z + ConditionalSetFloat(on_pos_z, Float(1), Float(0))
+        neg_z = neg_z + ConditionalSetFloat(on_pos_z, Float(0), Float(1))
+    return ConditionalSetFloat(
+        CompareFloats(pos_z, neg_z, "<"),
+        Float(1),
+        ConditionalSetFloat(CompareFloats(neg_z, pos_z, "<"), Float(-1), Float(0)),
+    )
+
+
 def _neg(v):
     return Vector3(Float(0) - v.x, v.y, Float(0) - v.z)
 
@@ -51,6 +66,7 @@ def at_safe_flank_stations(
     my_stam,
     danger=None,
     at_debug=None,
+    weak_z=None,
 ):
     """Left / right / trail outlets on AT-safe rays with clear pass from carrier.
 
@@ -65,9 +81,14 @@ def at_safe_flank_stations(
 
     if danger is None:
         danger = Bool(False)
+    if weak_z is None:
+        weak_z = Float(0)
 
     desired = unit_or_zero(opp_goal - carrier)
     lat = Vector3(Float(0) - desired.z, Float(0), desired.x)
+    attack_x = ConditionalSetFloat(
+        CompareFloats(opp_goal.x, carrier.x, ">"), Float(1), Float(-1)
+    )
     min_dist = r_int + Float(HOLD_OFFSET)
 
     aimable = anti_tackle.aim_is_safe(carrier, opponents, r_int, my_stam)
@@ -97,19 +118,20 @@ def at_safe_flank_stations(
     for safe, usable, heading, _abs_off, _t, _w, _ev, _prog in debug["probes"]:
         st, clear_ok = station_on_heading(carrier, heading, opponents, r_eff, min_dist, aimable)
         side = DotProduct(lat, heading)
-        fwd = DotProduct(desired, heading)
+        fwd = heading.x * attack_x
+        weakside = heading.z * weak_z * Float(0.35)
         # Prefer forward-usable AT dirs, then any AT-safe dir.
         q = ConditionalSetFloat(usable, Float(2), ConditionalSetFloat(safe, Float(1), Float(0)))
         base = And(safe, clear_ok)
 
         left_ok = And(base, CompareFloats(side, Float(0.05), ">"))
-        left_score = side + q * Float(0.1)
+        left_score = side + q * Float(0.1) + weakside
         better_l = And(left_ok, CompareFloats(left_score, best_left, ">"))
         left = ConditionalSetVector3(better_l, st, left)
         best_left = ConditionalSetFloat(better_l, left_score, best_left)
 
         right_ok = And(base, CompareFloats(side, Float(-0.05), "<"))
-        right_score = (Float(0) - side) + q * Float(0.1)
+        right_score = (Float(0) - side) + q * Float(0.1) + weakside
         better_r = And(right_ok, CompareFloats(right_score, best_right, ">"))
         right = ConditionalSetVector3(better_r, st, right)
         best_right = ConditionalSetFloat(better_r, right_score, best_right)

@@ -201,6 +201,7 @@ def build() -> None:
             team_has,
             Or(at_dbg["need_pass"], Or(at_dbg["own_goal_push"], at_dbg["retreating"])),
         )
+        weak_z = support_outlets.lower_density_flank_z(opponents)
         left_o, right_o, trail_o = support_outlets.at_safe_flank_stations(
             carrier,
             ball,
@@ -212,6 +213,7 @@ def build() -> None:
             carrier_stam,
             danger=_c_danger,
             at_debug=at_dbg,
+            weak_z=weak_z,
         )
         raw_support = [left_o, right_o, trail_o]
         debug_viz.plot_xz("Titanium.Support.Left", "Yellow", left_o)
