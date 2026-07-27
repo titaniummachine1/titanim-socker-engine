@@ -21,6 +21,8 @@ def build_carrier_move(
     r_eff,
     has_ball,
     charge,
+    walk_in_open,
+    walk_in_target,
     at_walk=None,
     at_debug=None,
 ):
@@ -41,7 +43,8 @@ def build_carrier_move(
         direction_ok=aimable,
     )
     ready = CompareFloats(charge, Float(FULL_CHARGE), ">=")
-    shoot_now = And(has_ball, And(lane_ok, ready))
+    walk_in_now = And(has_ball, walk_in_open)
+    shoot_now = And(has_ball, And(Not(walk_in_now), And(lane_ok, ready)))
 
     danger = And(
         has_ball,
@@ -113,13 +116,14 @@ def build_carrier_move(
             And(ready, And(can_pass, And(danger, And(Not(shoot_now), Not(instant_now))))),
         )
 
-    release_now = Or(shoot_now, pass_now)
+    release_now = And(Not(walk_in_now), Or(shoot_now, pass_now))
     shoot_to = me + aim * Float(10)
     pass_to = me + pass_dir * Float(10)
     inst_to = me + inst_dir * Float(10)
     move = ConditionalSetVector3(shoot_now, shoot_to, walk)
     move = ConditionalSetVector3(pass_now, pass_to, move)
     move = ConditionalSetVector3(instant_now, inst_to, move)
+    move = ConditionalSetVector3(walk_in_now, walk_in_target, move)
     chase = walk_target(me, ball, step=8.0)
     move = ConditionalSetVector3(has_ball, move, chase)
     return move, release_now, {

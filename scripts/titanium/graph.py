@@ -173,6 +173,9 @@ def build() -> None:
     ]
     carrier_stam = SoccerGetFloat("Ball Carrier Stamina")
     carrier_charge = SoccerGetFloat("Ball Carrier Shot Charge")
+    attack_walk_in_open, attack_walk_in_pt = unopposed_walk_in(
+        ball, opp_left_post, opp_right_post, opponents
+    )
 
     # ONE anti-tackle search shared by support stations + carrier walk + urgency.
     # (Previously rebuilt ~5×: support + urgent + each of 3 outfield carriers.)
@@ -232,10 +235,15 @@ def build() -> None:
             r_eff,
             team_has,
             carrier_charge,
+            attack_walk_in_open,
+            attack_walk_in_pt,
             at_walk=at_walk,
             at_debug=at_dbg,
         )
-        allow_teammate_steal = And(carrier_urgent, Not(carry_meta["kick_escape"]))
+        allow_teammate_steal = And(
+            carrier_urgent,
+            And(Not(carry_meta["kick_escape"]), Not(attack_walk_in_open)),
+        )
         _recv_ok, _recv_dir, steal_target = instant_pass.best_instant_handoff(
             carrier,
             mates_all,
@@ -339,6 +347,8 @@ def build() -> None:
                 r_eff,
                 has,
                 charge,
+                attack_walk_in_open,
+                attack_walk_in_pt,
             )
         # Defensive default: seal our assigned opponent's shot cone.
         move = threat_cover(marks, team_goal, left_post, right_post, r_int)
