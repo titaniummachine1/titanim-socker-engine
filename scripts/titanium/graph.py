@@ -206,6 +206,8 @@ def build() -> None:
             carrier,
             ball,
             opp_goal,
+            opp_left_post,
+            opp_right_post,
             team_goal,
             opponents,
             r_int,

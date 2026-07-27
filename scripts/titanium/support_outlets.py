@@ -9,7 +9,7 @@ from __future__ import annotations
 from titanium._env import *  # noqa: F401,F403
 from titanium.constants import HOLD_OFFSET, SUPPORT_OUTLET_DISTS
 from titanium.geometry import unit_or_zero
-from titanium.shot import clear_pass
+from titanium.shot import clear_pass, clear_shot
 
 
 def lower_density_flank_z(opponents):
@@ -59,6 +59,8 @@ def at_safe_flank_stations(
     carrier,
     ball,
     opp_goal,
+    opp_left_post,
+    opp_right_post,
     team_goal,
     opponents,
     r_int,
@@ -71,8 +73,10 @@ def at_safe_flank_stations(
     """Left / right / trail outlets on AT-safe rays with clear pass from carrier.
 
     Left/right = max lateral Dot among safe AT probe headings that still admit
-    a clear pass. Trail = safest back outlet. Fallbacks are forward-left /
-    forward-right / back, still pulled in until clear_pass (or min sep).
+    a clear pass, preferring stations with an immediate clear shot after
+    receiving. Trail = safest back outlet under the same one-ply preference.
+    Fallbacks are forward-left / forward-right / back, still pulled in until
+    clear_pass (or min sep).
 
     Pass a shared `at_debug` from one `search_safe_direction` to avoid rebuilding
     the entire AT probe set (support + carrier used to pay for it twice).
@@ -117,6 +121,12 @@ def at_safe_flank_stations(
 
     for safe, usable, heading, _abs_off, _t, _w, _ev, _prog in debug["probes"]:
         st, clear_ok = station_on_heading(carrier, heading, opponents, r_eff, min_dist, aimable)
+        # One ply: carrier→station must be clear, then prefer a shot from there.
+        # The +2 bonus dominates the bounded heading and weak-side tie-breaks.
+        shot_ok, _shot_aim = clear_shot(
+            st, opp_goal, opp_left_post, opp_right_post, opponents, r_eff
+        )
+        shot_bonus = ConditionalSetFloat(shot_ok, Float(2), Float(0))
         side = DotProduct(lat, heading)
         fwd = heading.x * attack_x
         weakside = heading.z * weak_z * Float(0.35)
@@ -125,19 +135,19 @@ def at_safe_flank_stations(
         base = And(safe, clear_ok)
 
         left_ok = And(base, CompareFloats(side, Float(0.05), ">"))
-        left_score = side + q * Float(0.1) + weakside
+        left_score = side + q * Float(0.1) + weakside + shot_bonus
         better_l = And(left_ok, CompareFloats(left_score, best_left, ">"))
         left = ConditionalSetVector3(better_l, st, left)
         best_left = ConditionalSetFloat(better_l, left_score, best_left)
 
         right_ok = And(base, CompareFloats(side, Float(-0.05), "<"))
-        right_score = (Float(0) - side) + q * Float(0.1) + weakside
+        right_score = (Float(0) - side) + q * Float(0.1) + weakside + shot_bonus
         better_r = And(right_ok, CompareFloats(right_score, best_right, ">"))
         right = ConditionalSetVector3(better_r, st, right)
         best_right = ConditionalSetFloat(better_r, right_score, best_right)
 
         trail_ok = And(base, CompareFloats(fwd, Float(-0.05), "<"))
-        trail_score = (Float(0) - fwd) + q * Float(0.1)
+        trail_score = (Float(0) - fwd) + q * Float(0.1) + shot_bonus
         better_t = And(trail_ok, CompareFloats(trail_score, best_trail, ">"))
         trail = ConditionalSetVector3(better_t, st, trail)
         best_trail = ConditionalSetFloat(better_t, trail_score, best_trail)
