@@ -17,6 +17,8 @@ from titanium.constants import (
     KICK_LIFT_PER_CHARGE,
     KICK_SPEED_BASE,
     KICK_SPEED_PER_CHARGE,
+    SPRINT_SPEED,
+    WALK_SPEED,
 )
 from titanium.geometry import clamp01, unit_or_zero
 from titanium.nodefn import graph_function
@@ -355,3 +357,50 @@ def _meet_point(me, ball, ball_vel, speed):  # inlined: 116 evals vs 336 as a fu
 def predict_ball_meet_point(me, ball, ball_vel, speed):
     """`speed` is a python float at every call site; params must be Nodes."""
     return _meet_point(me, ball, ball_vel, Float(speed))
+
+
+def assign_fastest_net_saver(bodies, threat_pt, threat_t):
+    """Pick the single teammate who should cut a net-bound ball.
+
+    Preference:
+      1. Whoever can arrive walking before `threat_t` (fastest walker)
+      2. Else whoever can arrive sprinting in time (fastest sprinter)
+      3. Else whoever arrives soonest at sprint (last resort)
+
+    Returns `(is_saver[4], needs_sprint[4])` — only the chosen saver is True;
+    `needs_sprint` is True only for that saver when walk cannot beat the ball.
+    """
+    walk = Float(WALK_SPEED)
+    sprint = Float(SPRINT_SPEED)
+    keys = []
+    walk_ts = []
+    for b in bodies:
+        d = Distance(b, threat_pt)
+        wt = d / walk
+        st = d / sprint
+        walk_ts.append(wt)
+        can_w = CompareFloats(wt, threat_t, "<=")
+        can_s = CompareFloats(st, threat_t, "<=")
+        # Walk-capable always outranks sprint-needed; among equals, earlier wins.
+        key = ConditionalSetFloat(
+            can_w,
+            wt,
+            ConditionalSetFloat(can_s, Float(100.0) + st, Float(200.0) + st),
+        )
+        keys.append(key)
+
+    best_key = keys[0]
+    best_body = bodies[0]
+    for b, k in zip(bodies[1:], keys[1:]):
+        better = CompareFloats(k, best_key, "<")
+        best_key = ConditionalSetFloat(better, k, best_key)
+        best_body = ConditionalSetVector3(better, b, best_body)
+
+    is_saver = [
+        CompareFloats(Distance(b, best_body), Float(0.35), "<") for b in bodies
+    ]
+    needs_sprint = [
+        And(is_saver[i], CompareFloats(walk_ts[i], threat_t, ">"))
+        for i in range(len(bodies))
+    ]
+    return is_saver, needs_sprint

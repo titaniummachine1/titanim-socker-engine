@@ -12,7 +12,11 @@ from titanium.constants import BALL_RADIUS, CARRIER_SPEED, SPRINT_SPEED, WALK_SP
 from titanium.geometry import pos, unit_or_zero
 from titanium.shot import unopposed_walk_in
 from titanium.carrier import build_carrier_move
-from titanium.ball_physics import own_goal_threat, predict_ball_meet_point
+from titanium.ball_physics import (
+    assign_fastest_net_saver,
+    own_goal_threat,
+    predict_ball_meet_point,
+)
 from titanium.goalkeeper import gk_policy, threat_cover
 from titanium.tackle import player_interact, tackle_plan
 from titanium import debug_viz, positioning
@@ -269,17 +273,23 @@ def build() -> None:
     # Time until a walk-in carrier reaches our mouth (carrier walks).
     walk_in_score_t = Distance(ball, walk_pt) / Float(CARRIER_SPEED)
 
+    # One saver for a net-bound ball: fastest walker who makes it, else
+    # fastest sprinter; sprint is last resort and only for that saver.
+    net_saver_flags, net_sprint_flags = assign_fastest_net_saver(
+        all_bodies, shot_threat_pt, shot_threat_t
+    )
+
     # Tackle assignment once for the whole team (not once per outfielder).
     duty_flags, chaser_flags, press_body = tackle_plan()
 
     # Soft space-claim values (who keeps a contested station).
-    # Emergency goal-prevention outranks carrier / cover.
+    # Emergency only for the assigned net saver / walk-in presser.
     move_pris = []
     for i in range(4):
         is_press = CompareFloats(Distance(all_bodies[i], press_body), Float(0.4), "<")
         emergency = Or(
             And(walk_in_threat, Or(duty_flags[i], is_press)),
-            net_shot_threat,  # whole team panics on net-bound flying ball
+            And(net_shot_threat, net_saver_flags[i]),
         )
         move_pris.append(
             positioning.task_value(
@@ -375,15 +385,13 @@ def build() -> None:
         )
 
         # Loose / flying ball.
-        # Panic: predicted path crosses OUR net → everyone intercepts; sprint
-        # if walking cannot arrive before the crossing (even if sprint is also
-        # late — still run). Normal loose: only closest claims at walk speed.
+        # Net-bound: only the single fastest saver claims it; sprint only if
+        # that saver cannot walk there before the crossing. Else closest walks.
         meet_point_walk = predict_ball_meet_point(me, ball, ball_vel, WALK_SPEED)
         meet_point_sprint = predict_ball_meet_point(me, ball, ball_vel, SPRINT_SPEED)
-        d_shot = Distance(me, shot_threat_pt)
-        walk_beats_shot = CompareFloats(d_shot / Float(WALK_SPEED), shot_threat_t, "<=")
-        # Sprint whenever walk loses the race to a net-bound ball.
-        sprint_save_shot = And(net_shot_threat, Not(walk_beats_shot))
+        i_am_net_saver = net_saver_flags[slot - 1]
+        net_needs_sprint = net_sprint_flags[slot - 1]
+        sprint_save_shot = And(net_shot_threat, And(i_am_net_saver, net_needs_sprint))
         d_ball = Distance(me, ball)
         sprint_save_walkin = And(
             walk_in_threat,
@@ -396,8 +404,7 @@ def build() -> None:
         loose_target = ConditionalSetVector3(
             sprint_save_shot, meet_point_sprint, meet_point_walk
         )
-        # Net-bound flying ball: all outfielders panic-chase (not only closest).
-        claim_loose = Or(closest, net_shot_threat)
+        claim_loose = Or(closest, And(net_shot_threat, i_am_net_saver))
         move = ConditionalSetVector3(And(loose, claim_loose), loose_target, move)
         debug_viz.plot_xz(f"Titanium.P{slot}.Pos", "Cyan", me)
         debug_viz.plot_xz(f"Titanium.P{slot}.Target", "Yellow", move)
@@ -426,6 +433,7 @@ def build() -> None:
         opp_has,
         loose,
         carrier_charge,
+        claim_net_threat=And(net_shot_threat, net_saver_flags[3]),
     )
     debug_viz.draw_gk_branches(gk_debug)
     # gk_policy already owns loose claim + net-bound panic (meet-point chase).

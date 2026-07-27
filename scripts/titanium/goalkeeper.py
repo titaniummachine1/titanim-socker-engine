@@ -188,18 +188,18 @@ def gk_policy(
     opp_has,
     loose,
     carrier_charge,
+    claim_net_threat=None,
 ):
     """GK stays inside the shot-intercept safe region.
 
-    Sprint only for a loose goal-bound ball that walk cannot reach in time.
-    Held-ball cover uses the carrier body + their current shot charge so we
-    step forward while they still have charge time left. Interact follows
-    AIA Player Interact so any nearby claimable ball is always grabbed.
+    Sprint only for a loose goal-bound ball that walk cannot reach in time,
+    and only when this GK is the assigned net saver (`claim_net_threat`).
 
-    Returns `(move, sprint, interact, debug)` — `debug` is a dict of the
-    intermediate values `titanium.debug_viz` draws; keeping the computation
-    here and the drawing there is the module split, not a hidden dependency.
+    Returns `(move, sprint, interact, debug)`.
     """
+    if claim_net_threat is None:
+        claim_net_threat = Bool(True)
+
     interact_r = SoccerGetFloat("Player Interact Radius")
     cover, seals = gk_cover_stand(ball, team_goal, left_post, right_post, interact_r)
 
@@ -212,13 +212,12 @@ def gk_policy(
     clear_spot = walk_target(gk, clear_target, step=14)
     move = ConditionalSetVector3(has_ball, clear_spot, cover)
 
-    # Sprint to intercept a free ball whose predicted path crosses our net —
-    # if walking cannot arrive in time. Panic: still sprint even when late.
+    # Net-bound loose ball: only the assigned fastest saver claims it.
     goal_half_width_est = Abs(left_post.z)
     is_threat_raw, threat_time, threat_point = own_goal_threat(
         ball, ball_vel, team_goal.x, goal_half_width_est
     )
-    is_threat = And(is_threat_raw, loose)
+    is_threat = And(And(is_threat_raw, loose), claim_net_threat)
     dist_gk_threat = Distance(gk, threat_point)
     walk_time_threat = dist_gk_threat / Float(WALK_SPEED)
     walk_cant_make_it = CompareFloats(walk_time_threat, threat_time, ">")
@@ -237,50 +236,27 @@ def gk_policy(
     )
     move = ConditionalSetVector3(opp_has, press, move)
 
-    # Net-bound threat: chase the predicted path at sprint when needed —
-    # do not fall back to live-ball pursuit that bleeds ground.
     meet_point_gk = predict_ball_meet_point(gk, ball, ball_vel, WALK_SPEED)
     meet_point_gk_sprint = predict_ball_meet_point(gk, ball, ball_vel, SPRINT_SPEED)
-    threat_chase = ConditionalSetVector3(sprint, meet_point_gk_sprint, threat_point)
+    threat_chase = ConditionalSetVector3(sprint, meet_point_gk_sprint, meet_point_gk)
     move = ConditionalSetVector3(is_threat, threat_chase, move)
 
     debug = {"is_threat": is_threat, "threat_point": threat_point, "opp_has": opp_has, "press": press, "move": move}
 
-    # When the ball is claimable (nearby / loose toward us), step onto it so
-    # Interact can fire — do not stay glued to a cover point and let it pass.
-    #
-    # A genuine chase (not already in interact range) targets the ball's
-    # predicted path, not its live position — chasing live position is a
-    # pure-pursuit curve that bleeds ground to any ball with real velocity.
-    # Once it's already `nearby` there's nothing left to lead, so that case
-    # keeps the raw ball position.
     nearby = SoccerGetBool("Is Ball Nearby Team Player 4")
     closest_gk = SoccerGetBool("Is Team Player 4 Closest Teammate to Ball")
     chase_target_gk = ConditionalSetVector3(nearby, ball, meet_point_gk)
     go_to_ball = Or(And(loose, closest_gk), And(nearby, Not(has_ball)))
     chase_ok = Or(nearby, seals(gk))
-    # Threat already owns the move; don't let ordinary chase override panic.
     ordinary_chase = And(And(go_to_ball, chase_ok), Not(is_threat))
     move = ConditionalSetVector3(ordinary_chase, chase_target_gk, move)
     move = ConditionalSetVector3(And(And(nearby, Not(has_ball)), Not(is_threat)), ball, move)
 
-    # The keeper never crosses midfield, however tempting the press or a
-    # loose ball upfield looks — being beaten past the halfway line leaves an
-    # open net behind him, and the outfield cover players exist to handle
-    # anything out there.
-    #
-    # Deliberately NOT applied while carrying: the kick fires along MoveTo, so
-    # clamping x would rotate the clear aim back toward our own goal.
     move = ConditionalSetVector3(has_ball, move, clamp_own_half(move, team_goal))
 
-    # Same permanent-full-charge policy as everyone else: hold the ball on a
-    # maxed shot and only let go once the clear lane is actually open, rather
-    # than punting it into the nearest opponent at a fixed charge threshold.
     clear_aim = unit_or_zero(
         ConditionalSetVector3(IsNull(clear_dir), pos("Opponent Goal Center") - gk, clear_dir)
     )
-    # Same shot-origin correction as build_carrier_move: the kick fires from
-    # the GK's own center, not the ball's visually-offset held position.
     clear_invariants = [
         opponent_invariants(o, gk, r_eff, opponent_half_angle(o, gk, r_eff))
         for o in opponents
