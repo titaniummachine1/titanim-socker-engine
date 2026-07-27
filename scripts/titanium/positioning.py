@@ -142,8 +142,16 @@ def preferred_spacing(r_int):
     return r_int + Float(HOLD_OFFSET)
 
 
-def reduce_role_overlap(anchor, point, spacing):
-    """Nudge `point` out to `spacing` from `anchor` when overlapping."""
+def reduce_role_overlap(anchor, point, spacing, strength=None):
+    """Nudge `point` partway toward the preferred ring around `anchor`.
+
+    Applies `strength * (spacing - dist)` outward — not a hard snap to the
+    ring — so two near-equal roles do not bounce each tick at 1 FPS.
+    """
+    from titanium.constants import OVERLAP_SHIFT_STRENGTH
+
+    if strength is None:
+        strength = Float(OVERLAP_SHIFT_STRENGTH)
     delta = point - anchor
     dist = Magnitude(delta)
     too_close = CompareFloats(dist, spacing, "<")
@@ -154,8 +162,9 @@ def reduce_role_overlap(anchor, point, spacing):
             delta,
         )
     )
-    shifted = anchor + safe_dir * spacing
-    return ConditionalSetVector3(too_close, shifted, point)
+    gap = spacing - dist
+    nudged = point + safe_dir * gap * strength
+    return ConditionalSetVector3(too_close, nudged, point)
 
 
 # Back-compat aliases (old collision-flavoured names).
@@ -171,21 +180,31 @@ def task_value(
     closest_to_ball,
     duty,
     is_press_body,
+    emergency=None,
 ):
-    """Expected tactical value of this player's current task (higher keeps space)."""
+    """Expected tactical value of this player's current task (higher keeps space).
+
+    emergency (goal prevention / net-bound claim) outranks carrier movement.
+    """
     from titanium.constants import (
         PRI_CARRIER,
+        PRI_EMERGENCY,
         PRI_LOOSE_CLAIM,
         PRI_PRESS_TACKLE,
         PRI_SUPPORT,
         PRI_THREAT_COVER,
     )
 
+    if emergency is None:
+        emergency = Bool(False)
+
+    # Low → high so later overrides win.
     p = Float(PRI_THREAT_COVER)
     p = ConditionalSetFloat(And(team_has, Not(has_ball)), Float(PRI_SUPPORT), p)
-    p = ConditionalSetFloat(And(opp_has, Or(duty, is_press_body)), Float(PRI_PRESS_TACKLE), p)
-    p = ConditionalSetFloat(And(loose, closest_to_ball), Float(PRI_LOOSE_CLAIM), p)
     p = ConditionalSetFloat(has_ball, Float(PRI_CARRIER), p)
+    p = ConditionalSetFloat(And(loose, closest_to_ball), Float(PRI_LOOSE_CLAIM), p)
+    p = ConditionalSetFloat(And(opp_has, Or(duty, is_press_body)), Float(PRI_PRESS_TACKLE), p)
+    p = ConditionalSetFloat(emergency, Float(PRI_EMERGENCY), p)
     return p
 
 
@@ -206,17 +225,13 @@ def resolve_space_claims(
 ):
     """Soft utility resolver for overlapping role stations.
 
-    desired tactical positions + soft overlap penalty + priority-weighted
-    conflict resolution. No player-player collision model.
-
-    if my_value clearly lower: shift to preferred_spacing (or collapse gap
-    toward carrier when collapse_ok — emergency handoff).
-    if near-equal: mild spread only.
-    if higher: keep desired_target.
+    Resolve only against the strongest conflicting claim (value gap + overlap)
+    so teammate list order cannot steer the result.
     """
     from titanium.constants import (
         COLLAPSE_SPACING_FRAC,
         MILD_SPREAD_FRAC,
+        OVERLAP_SHIFT_STRENGTH,
         PRI_CARRIER,
         PRI_VALUE_BAND,
         ROLE_SHIFT_FRAC,
@@ -228,29 +243,47 @@ def resolve_space_claims(
     collapse = pref * Float(COLLAPSE_SPACING_FRAC)
     band = Float(PRI_VALUE_BAND)
     carrier_v = Float(PRI_CARRIER)
+    strength = Float(OVERLAP_SHIFT_STRENGTH)
     if collapse_ok is None:
         collapse_ok = Bool(False)
-    target = desired_target
 
-    for peer, their_v in zip(peer_bodies, peer_values):
-        me_end = simulate_walk_end(me, target)
-        lower = CompareFloats(my_value + band, their_v, "<")
-        near_eq = CompareFloats(Abs(my_value - their_v), band, "<=")
-        vs_carrier = CompareFloats(their_v, carrier_v - band, ">=")
-        # Emergency: support may collapse toward carrier for a handoff.
-        lower_gap = ConditionalSetFloat(
-            And(collapse_ok, vs_carrier), collapse, shift
-        )
-        after_eq = ConditionalSetVector3(
-            And(near_eq, CompareFloats(Distance(me_end, peer), mild, "<")),
-            reduce_role_overlap(peer, me_end, mild),
-            target,
-        )
-        target = ConditionalSetVector3(
-            And(lower, CompareFloats(Distance(me_end, peer), lower_gap, "<")),
-            reduce_role_overlap(peer, me_end, lower_gap),
-            after_eq,
-        )
+    me_end0 = simulate_walk_end(me, desired_target)
+
+    # Pick the single strongest conflict: (their_v - my_v) + positive overlap.
+    best_peer = peer_bodies[0]
+    best_v = peer_values[0]
+    d0 = Distance(me_end0, best_peer)
+    ov0 = pref - d0
+    ov0_pos = ConditionalSetFloat(CompareFloats(ov0, Float(0), ">"), ov0, Float(0))
+    best_score = (best_v - my_value) + ov0_pos
+
+    for peer, their_v in zip(peer_bodies[1:], peer_values[1:]):
+        d = Distance(me_end0, peer)
+        ov = pref - d
+        ov_pos = ConditionalSetFloat(CompareFloats(ov, Float(0), ">"), ov, Float(0))
+        score = (their_v - my_value) + ov_pos
+        better = CompareFloats(score, best_score, ">")
+        best_peer = ConditionalSetVector3(better, peer, best_peer)
+        best_v = ConditionalSetFloat(better, their_v, best_v)
+        best_score = ConditionalSetFloat(better, score, best_score)
+
+    me_end = me_end0
+    lower = CompareFloats(my_value + band, best_v, "<")
+    near_eq = CompareFloats(Abs(my_value - best_v), band, "<=")
+    vs_carrier = CompareFloats(Abs(best_v - carrier_v), band, "<=")
+    lower_gap = ConditionalSetFloat(And(collapse_ok, vs_carrier), collapse, shift)
+
+    after_eq = ConditionalSetVector3(
+        And(near_eq, CompareFloats(Distance(me_end, best_peer), mild, "<")),
+        reduce_role_overlap(best_peer, me_end, mild, strength),
+        desired_target,
+    )
+    # Large value gap: full-strength shift; near-equal already used soft strength.
+    target = ConditionalSetVector3(
+        And(lower, CompareFloats(Distance(me_end, best_peer), lower_gap, "<")),
+        reduce_role_overlap(best_peer, me_end, lower_gap, Float(1.0)),
+        after_eq,
+    )
 
     if ball is not None and opp_goal is not None and carrier_retreating is not None:
         attack_east = CompareFloats(opp_goal.x, Float(0), ">")

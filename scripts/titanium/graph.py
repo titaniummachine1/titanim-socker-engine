@@ -273,9 +273,14 @@ def build() -> None:
     duty_flags, chaser_flags, press_body = tackle_plan()
 
     # Soft space-claim values (who keeps a contested station).
+    # Emergency goal-prevention outranks carrier / cover.
     move_pris = []
     for i in range(4):
         is_press = CompareFloats(Distance(all_bodies[i], press_body), Float(0.4), "<")
+        emergency = Or(
+            And(walk_in_threat, Or(duty_flags[i], is_press)),
+            And(net_shot_threat, closest_flags[i]),
+        )
         move_pris.append(
             positioning.task_value(
                 has_flags[i],
@@ -285,6 +290,7 @@ def build() -> None:
                 closest_flags[i],
                 duty_flags[i],
                 is_press,
+                emergency=emergency,
             )
         )
 
