@@ -7,7 +7,7 @@ Stations lie on the same rays AT marks safe for the held ball (red discs).
 from __future__ import annotations
 
 from titanium._env import *  # noqa: F401,F403
-from titanium.constants import SUPPORT_OUTLET_DISTS, TEAMMATE_MIN_SEP_FRAC
+from titanium.constants import HOLD_OFFSET, SUPPORT_OUTLET_DISTS
 from titanium.geometry import unit_or_zero
 from titanium.shot import clear_pass
 
@@ -50,12 +50,16 @@ def at_safe_flank_stations(
     r_eff,
     my_stam,
     danger=None,
+    at_debug=None,
 ):
     """Left / right / trail outlets on AT-safe rays with clear pass from carrier.
 
     Left/right = max lateral Dot among safe AT probe headings that still admit
     a clear pass. Trail = safest back outlet. Fallbacks are forward-left /
     forward-right / back, still pulled in until clear_pass (or min sep).
+
+    Pass a shared `at_debug` from one `search_safe_direction` to avoid rebuilding
+    the entire AT probe set (support + carrier used to pay for it twice).
     """
     from titanium import anti_tackle
 
@@ -64,7 +68,7 @@ def at_safe_flank_stations(
 
     desired = unit_or_zero(opp_goal - carrier)
     lat = Vector3(Float(0) - desired.z, Float(0), desired.x)
-    min_dist = r_int * Float(TEAMMATE_MIN_SEP_FRAC)
+    min_dist = r_int + Float(HOLD_OFFSET)
 
     aimable = anti_tackle.aim_is_safe(carrier, opponents, r_int, my_stam)
     left_fb, _ = station_on_heading(
@@ -75,9 +79,13 @@ def at_safe_flank_stations(
     )
     trail_fb, _ = station_on_heading(carrier, _neg(desired), opponents, r_eff, min_dist, aimable)
 
-    _dir, debug = anti_tackle.search_safe_direction(
-        carrier, opp_goal, ball, opponents, r_int, team_goal, my_stam, danger
-    )
+    if at_debug is None:
+        _dir, debug = anti_tackle.search_safe_direction(
+            carrier, opp_goal, ball, opponents, r_int, team_goal, my_stam, danger
+        )
+        _ = _dir
+    else:
+        debug = at_debug
 
     left = left_fb
     right = right_fb

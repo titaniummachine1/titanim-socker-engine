@@ -3,14 +3,15 @@
 Build from the repo root above:
 
 ```
-python scripts\build_titanium.py                         # release (default)
-python scripts\build_titanium.py --promote               # gate winner only
-python scripts\build_titanium.py --with-anti-tackle      # challenger (release)
+python scripts\build_titanium.py                         # release graph → Titanium_test
+python scripts\build_titanium.py --with-anti-tackle      # challenger graph (no sim gate)
+python scripts\build_titanium.py --with-anti-tackle --gate  # also run promotion matches
 python scripts\build_titanium.py --debug                 # keep DebugDraw/TimePlot
 ```
 
 `--strip-debug` still works as a no-op alias for release. Use `--debug` / `--normal`
-only when inspecting sinks.
+only when inspecting sinks. Promotion/`cargo` matches are **not** part of a normal
+build — pass `--gate` (or `--promote`) when you want that.
 
 Graph optimisation is **only** via `AIGamePyLibrary.SaveData(optimize=...)` —
 do not add duplicate prune passes in `deploy.py`.
@@ -52,7 +53,7 @@ claims nesting reads back null; in the sim it works.
 | `constants.py` | measured physics — do not "tidy" these, they are measurements |
 | `anti_tackle.py` | **challenger only** — 5-probe binary search on held-ball heading |
 | `ball_physics.py` | trajectory, own-goal threat, meet point (approximation, see below) |
-| `goalkeeper.py` | GK policy; the only place allowed to sprint outside a 50/50 |
+| `goalkeeper.py` | GK policy; sprint only to stop a net-bound loose ball walk can't reach |
 | `tackle.py` | who presses Interact on a carrier |
 | `shot.py` | shot direction / post clearance |
 | `carrier.py` | carrying and clearing |

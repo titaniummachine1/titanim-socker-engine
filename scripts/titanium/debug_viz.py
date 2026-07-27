@@ -304,6 +304,20 @@ def plot_anti_tackle(slot: int, has_ball, debug: dict) -> None:
             String(""),
             ConditionalSetFloat(debug["need_pass"], Float(1), Float(0)),
         )
+    if "any_forward_next" in debug:
+        TimePlot(
+            String(f"{prefix}.FwdNext"),
+            "Green",
+            String(""),
+            ConditionalSetFloat(debug["any_forward_next"], Float(1), Float(0)),
+        )
+    if "trapped_next" in debug:
+        TimePlot(
+            String(f"{prefix}.TrappedNext"),
+            "Red",
+            String(""),
+            ConditionalSetFloat(debug["trapped_next"], Float(1), Float(0)),
+        )
 
     SetVariable(had_ball_key, ConditionalSetFloat(has_ball, Float(1), Float(0)))
     SetVariable(pred_key, ConditionalSetFloat(has_ball, pred_f, Float(0)))

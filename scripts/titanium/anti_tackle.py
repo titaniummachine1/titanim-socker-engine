@@ -1,16 +1,23 @@
 """Held-ball rotation dodge — runs ONCE per tick.
 
-Probes headings; marks which end-of-tick ball positions would be tackled
-(stam-capable opps only). Among SAFE probes, pick the heading that
-maximizes walk eval (progress + corridor + clearance). If no safe heading,
-caller should pass to a teammate.
+Walk choice uses end-of-THIS-tick arcs (where bodies land after MoveTo).
+A second tick of foresight re-checks forward-open arcs from that future
+state: if the attacker cannot walk toward the enemy goal now OR after this
+tick, eval takes AT_NO_FORWARD_PENALTY (−10) and the caller must pass —
+before AT starts shoving them backward into their own half.
 """
 from __future__ import annotations
 
 import math
 
 from titanium._env import *  # noqa: F401,F403
-from titanium.constants import FIXED_DT, HOLD_OFFSET, KEEP_BALL_DANGER_PENALTY, WALK_SPEED
+from titanium.constants import (
+    AT_NO_FORWARD_PENALTY,
+    FIXED_DT,
+    HOLD_OFFSET,
+    KEEP_BALL_DANGER_PENALTY,
+    WALK_SPEED,
+)
 from titanium.geometry import rotate_xz, unit_or_zero
 from titanium import positioning
 
@@ -27,6 +34,7 @@ _PROBE_OFFSETS = (
 ARC_MARGIN = math.radians(1.0)
 _UNSAFE_EVAL = Float(-1000)
 _SCORE_EVAL = Float(1e6)
+_NO_FORWARD_PEN = Float(AT_NO_FORWARD_PENALTY)
 _WALK = Float(WALK_SPEED)
 _DT = Float(FIXED_DT)
 
@@ -248,6 +256,14 @@ def blocked_arcs(me, opponents, r_int, my_stam, hold=HOLD_OFFSET):
     return arcs
 
 
+def _arc_candidates(desired_dir, arcs):
+    candidates = [desired_dir]
+    for arc in arcs:
+        left, right = arc_edges(arc)
+        candidates.extend((left, right))
+    return candidates
+
+
 def best_open_direction(desired_dir, arcs):
     """Direction closest to `desired_dir` that no arc blocks.
 
@@ -262,10 +278,7 @@ def best_open_direction(desired_dir, arcs):
     covered: there is nowhere to walk without being tackled, so the caller
     should pass instead of retreating.
     """
-    candidates = [desired_dir]
-    for arc in arcs:
-        left, right = arc_edges(arc)
-        candidates.extend((left, right))
+    candidates = _arc_candidates(desired_dir, arcs)
 
     best = desired_dir
     best_score = _UNSAFE_EVAL
@@ -281,6 +294,23 @@ def best_open_direction(desired_dir, arcs):
         best_score = ConditionalSetFloat(better, score, best_score)
         any_open = Or(any_open, open_)
     return best, any_open
+
+
+def any_forward_open(desired_dir, arcs):
+    """True if some unblocked arc-candidate aims at/toward the enemy goal.
+
+    `desired_dir` is the unit vector toward the attack goal. Progress ≥ 0 means
+    the heading is not retreating. Used for this-tick and tick+1 foresight:
+    no forward-open angle ⇒ attacker is boxed (−10 eval / pass now).
+    """
+    any_fwd = Bool(False)
+    for cand in _arc_candidates(desired_dir, arcs):
+        blocked = Bool(False)
+        for arc in arcs:
+            blocked = Or(blocked, hold_direction_blocked(cand, arc))
+        forward = CompareFloats(DotProduct(cand, desired_dir), Float(0), ">=")
+        any_fwd = Or(any_fwd, And(Not(blocked), forward))
+    return any_fwd
 
 
 def aim_is_safe(me, opponents, r_int, my_stam, hold=HOLD_OFFSET):
@@ -399,7 +429,9 @@ def search_safe_direction(
 ):
     """Among safe+forward probes, pick max eval.
 
-    If the only safe options go backward (hurt eval), need_pass — do not retreat.
+    Walk heading = end-of-THIS-tick arcs. Tick+1 foresight: from the predicted
+    end state, re-check forward-open arcs. No forward walk now or next ⇒
+    −AT_NO_FORWARD_PENALTY eval and need_pass (pass before AT shoves us back).
     """
     if danger is None:
         danger = Bool(False)
@@ -414,6 +446,7 @@ def search_safe_direction(
     # is the EXACT tightest line past a defender, not the nearest of 5 samples.
     arcs = blocked_arcs(me, opponents, r_int, my_stam, hold)
     open_dir, any_open = best_open_direction(desired_dir, arcs)
+    any_forward = any_forward_open(desired_dir, arcs)
 
     # Headings offered to `support_outlets`. Deliberately the five fixed offsets
     # rather than every arc edge: the arcs decide where the CARRIER walks, but
@@ -447,14 +480,13 @@ def search_safe_direction(
     # `support_outlets` reads their per-heading safety and `debug_viz` plots
     # them, but they no longer select the direction.
     any_safe = any_open
-    any_usable = any_open
+    any_usable = any_forward
     best_dir = open_dir
-    best_eval = DotProduct(open_dir, desired_dir)
     best_offset = Float(0)
 
     # Own-goal guard still needs the actual end-of-tick ball position: the arcs
     # answer "can I keep the ball", not "does keeping it put it in my own net".
-    _me_end, ball_end = simulate_end_of_tick(me, best_dir, move_step, hold)
+    me_end, ball_end = simulate_end_of_tick(me, best_dir, move_step, hold)
     enemy_net = positioning.ball_in_goal_net(ball_end, opp_goal)
     own_net = positioning.ball_in_goal_net(ball_end, team_goal)
     own_goal_ok = And(
@@ -462,18 +494,45 @@ def search_safe_direction(
         Not(own_net),
     )
     predicted_safe = Or(enemy_net, And(any_open, own_goal_ok))
-    # No forward-safe walk (only back / none) → pass, never walk backward.
-    # Exception: enemy-net finish is usable even if classified oddly.
-    need_pass = Not(any_usable)
+    # Progress toward the attack goal; negative = AT is walking us backward.
+    toward_attack = unit_or_zero(opp_goal - me)
+    retreating = CompareFloats(DotProduct(best_dir, toward_attack), Float(0), "<")
+    # AT open angle that still parks the ball into/near our net → force handoff.
+    own_goal_push = And(any_open, Not(own_goal_ok))
+
+    # --- Tick+1 foresight -------------------------------------------------
+    # Assume this tick's MoveTo lands: me→me_end, opps one step toward us
+    # (same chase model as hold_block_arc). From that board, ask again whether
+    # ANY forward-open heading exists. If not, we are about to be boxed — pass
+    # THIS tick while a helper can still take the ball.
+    opp_ends = [step_toward(opp, me, _WALK, _DT) for opp in opponents]
+    arcs_next = blocked_arcs(me_end, opp_ends, r_int, my_stam, hold)
+    desired_next = unit_or_zero(opp_goal - me_end)
+    any_forward_next = any_forward_open(desired_next, arcs_next)
+
+    trapped_now = Not(any_forward)
+    trapped_next = Not(any_forward_next)
+    no_forward = Or(trapped_now, trapped_next)
+    # No forward-safe walk now/next, or chosen walk threatens own goal → pass.
+    need_pass = Or(no_forward, own_goal_push)
+
+    # −10 when the attacker cannot progress toward the enemy goal.
+    best_eval = DotProduct(open_dir, desired_dir) - ConditionalSetFloat(
+        no_forward, _NO_FORWARD_PEN, Float(0)
+    )
 
     return best_dir, {
         "any_safe": any_safe,
         "any_forward": any_usable,
+        "any_forward_next": any_forward_next,
         "predicted_safe": predicted_safe,
         "probes": probes,
         "chosen_offset": best_offset,
         "best_eval": best_eval,
         "need_pass": need_pass,
+        "retreating": Or(retreating, no_forward),
+        "own_goal_push": own_goal_push,
+        "trapped_next": trapped_next,
     }
 
 
@@ -492,4 +551,7 @@ def carrier_walk_target(
     direction, debug = search_safe_direction(
         me, desired, ball_start, opponents, r_int, team_goal, my_stam, danger, hold, step
     )
-    return me + direction * Float(step), debug
+    walk = me + direction * Float(step)
+    # Do not walk into our own goal — freeze and demand a helper handoff.
+    walk = ConditionalSetVector3(debug["own_goal_push"], me, walk)
+    return walk, debug

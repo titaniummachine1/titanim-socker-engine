@@ -67,8 +67,11 @@ HOLD_PROXY = 0.55
 # Ball must stay this far (along pitch X) on the pitch side of our goal plane
 # after an end-of-tick hold so anti-tackle rotation cannot own-goal.
 OWN_GOAL_PLANE_CLEARANCE = HOLD_OFFSET + BALL_RADIUS + 0.5
-# Teammate spacing: never closer than full tackle range (r_int).
-TEAMMATE_MIN_SEP_FRAC = 1.0
+# Teammate body-body spacing must keep the held ball outside a mate's interact
+# radius even if the carrier aims the hold offset straight at them:
+#   min_sep = r_int + HOLD_OFFSET
+# (ball at carrier + hold toward mate ⇒ tackle when dist(mate, ball) ≤ r_int).
+TEAMMATE_MIN_SEP_FRAC = 1.0  # kept for docs; separation uses HOLD_OFFSET addend
 # Support outlets along AT-safe headings: try far→near until clear_pass opens.
 SUPPORT_OUTLET_DISTS = (9.0, 7.5, 6.0, 4.5, 3.5)
 # Pass-danger: AT tracks opps inside 2×r_int of carrier center. When an opp has
@@ -78,6 +81,9 @@ SUPPORT_OUTLET_DISTS = (9.0, 7.5, 6.0, 4.5, 3.5)
 PASS_DANGER_APPROACH_FRAC = 0.25  # "closed more than 1/4 of the way in"
 PASS_DANGER_TRACK_MULT = 2.0  # same 2×r_int bubble as anti_tackle tracking
 KEEP_BALL_DANGER_PENALTY = 2.0
+# Anti-tackle: attacker cannot walk forward toward the enemy goal (now, or
+# predicted after this tick finalizes) → treat as catastrophic eval / pass now.
+AT_NO_FORWARD_PENALTY = 10.0
 # Playable AABB — matches aicomp-soccer-sim SimParams fallback / Unity pitch.
 # Held-ball offset is projected into this region (sidelines always; endlines
 # only outside the goal mouth) exactly like `project_hold_into_playable`.

@@ -289,5 +289,5 @@ def gk_policy(
     ]
     gk_ready = CompareFloats(charge, Float(FULL_CHARGE), ">=")
     gk_shoot = And(has_ball, And(is_legal_direction(clear_aim, clear_invariants), gk_ready))
-    interact = player_interact(4, has_ball, gk_shoot)
+    interact = player_interact(4, has_ball, gk_shoot, move, sprint)
     return move, sprint, interact, debug

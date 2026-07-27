@@ -17,7 +17,6 @@ from titanium.constants import (
     PITCH_X_MIN,
     PITCH_Z_MAX,
     PITCH_Z_MIN,
-    TEAMMATE_MIN_SEP_FRAC,
     WALK_SPEED,
 )
 from titanium.geometry import unit_or_zero
@@ -134,8 +133,13 @@ def opponent_in_pass_danger(me, opponents, r_int, my_stam=None, opp_staminas=Non
 
 
 def teammate_min_separation(r_int):
-    """Min teammate gap: full tackle range (r_int) — no closer."""
-    return r_int * Float(TEAMMATE_MIN_SEP_FRAC)
+    """Min body-body gap so a mate cannot tackle our held ball.
+
+    Worst case: carrier aims the hold offset straight at the teammate, so the
+    ball sits `HOLD_OFFSET` closer than the bodies. Interact needs `r_int` to
+    the ball ⇒ bodies must stay at least `r_int + HOLD_OFFSET` apart.
+    """
+    return r_int + Float(HOLD_OFFSET)
 
 
 def push_apart_from(anchor, point, min_sep):
@@ -154,11 +158,24 @@ def push_apart_from(anchor, point, min_sep):
     return ConditionalSetVector3(too_close, pushed, point)
 
 
-def clamp_support_station(me, support_target, anchors, r_int, priority_anchor=None):
-    """Helper yields: end-of-tick stay >= r_int from each anchor.
+def clamp_support_station(
+    me,
+    support_target,
+    anchors,
+    r_int,
+    priority_anchor=None,
+    ball=None,
+    opp_goal=None,
+    carrier_retreating=None,
+):
+    """Helper yields: end-of-tick stay ≥ r_int+hold from each anchor.
 
-    `priority_anchor` (carrier) is applied first — helpers move out of the
-    attacker's way; the carrier is never pushed by this.
+    `priority_anchor` (carrier / current sacrifice / attacker) is applied
+    first — helpers move out of their way; the priority body is never pushed.
+
+    When `carrier_retreating` and ball/opp_goal are set: do not push a helper
+    further toward the enemy goal than the ball — clearing the carrier's path
+    must not park outlets ahead of a backing ball.
     """
     min_sep = teammate_min_separation(r_int)
     target = support_target
@@ -169,7 +186,15 @@ def clamp_support_station(me, support_target, anchors, r_int, priority_anchor=No
         me_end = simulate_walk_end(me, target)
         need_push = CompareFloats(Distance(me_end, anchor), min_sep, "<")
         pushed = push_apart_from(anchor, me_end, min_sep)
-        # Extra step away so the helper clears the bubble instead of hugging it.
-        far = pushed + unit_or_zero(pushed - anchor) * Float(2.0)
-        target = ConditionalSetVector3(need_push, far, target)
+        target = ConditionalSetVector3(need_push, pushed, target)
+
+    if ball is not None and opp_goal is not None and carrier_retreating is not None:
+        # Attack east when opp_goal.x > 0.
+        attack_east = CompareFloats(opp_goal.x, Float(0), ">")
+        past_east = CompareFloats(target.x, ball.x, ">")
+        past_west = CompareFloats(target.x, ball.x, "<")
+        past_ball = ConditionalSetBool(attack_east, past_east, past_west)
+        # Pull helper back onto the ball's goal-line X; keep their lateral Z.
+        capped = Vector3(ball.x, target.y, target.z)
+        target = ConditionalSetVector3(And(carrier_retreating, past_ball), capped, target)
     return target

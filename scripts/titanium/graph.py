@@ -8,13 +8,13 @@ from __future__ import annotations
 
 from titanium._env import *  # noqa: F401,F403
 from titanium._env import WITH_ANTI_TACKLE
-from titanium.constants import BALL_RADIUS, SPRINT_SPEED, WALK_SPEED
+from titanium.constants import BALL_RADIUS, CARRIER_SPEED, SPRINT_SPEED, WALK_SPEED
 from titanium.geometry import pos, unit_or_zero
-from titanium.shot import nearest_opponent_dist
+from titanium.shot import unopposed_walk_in
 from titanium.carrier import build_carrier_move
-from titanium.ball_physics import predict_ball_meet_point
+from titanium.ball_physics import own_goal_threat, predict_ball_meet_point
 from titanium.goalkeeper import gk_policy, threat_cover
-from titanium.tackle import player_interact
+from titanium.tackle import player_interact, tackle_plan
 from titanium import debug_viz, positioning
 from titanium import support_outlets
 
@@ -160,8 +160,34 @@ def build() -> None:
         h1, p1, ConditionalSetVector3(h2, p2, ConditionalSetVector3(h3, p3, p4))
     )
 
+    outfield = [p1, p2, p3]
+    carrier_stam = SoccerGetFloat("Ball Carrier Stamina")
+    carrier_charge = SoccerGetFloat("Ball Carrier Shot Charge")
+
+    # ONE anti-tackle search shared by support stations + carrier walk + urgency.
+    # (Previously rebuilt ~5×: support + urgent + each of 3 outfield carriers.)
     if WITH_ANTI_TACKLE:
-        carrier_stam = SoccerGetFloat("Ball Carrier Stamina")
+        from titanium import anti_tackle
+        from titanium import instant_pass
+
+        _c_danger = And(
+            team_has,
+            positioning.opponent_in_pass_danger(carrier, opponents, r_int, carrier_stam),
+        )
+        at_walk, at_dbg = anti_tackle.carrier_walk_target(
+            carrier,
+            opp_goal,
+            ball,
+            opponents,
+            r_int,
+            team_goal,
+            carrier_stam,
+            _c_danger,
+        )
+        carrier_urgent = And(
+            team_has,
+            Or(at_dbg["need_pass"], Or(at_dbg["own_goal_push"], at_dbg["retreating"])),
+        )
         left_o, right_o, trail_o = support_outlets.at_safe_flank_stations(
             carrier,
             ball,
@@ -171,90 +197,187 @@ def build() -> None:
             r_int,
             r_eff,
             carrier_stam,
+            danger=_c_danger,
+            at_debug=at_dbg,
         )
         raw_support = [left_o, right_o, trail_o]
         debug_viz.plot_xz("Titanium.Support.Left", "Yellow", left_o)
         debug_viz.plot_xz("Titanium.Support.Right", "Yellow", right_o)
         debug_viz.plot_xz("Titanium.Support.Trail", "Yellow", trail_o)
-    else:
-        raw_support = []
-        for ahead, side in ((9.0, 7.0), (9.0, -7.0), (-6.0, 0.0)):
-            raw_support.append(ball + fwd * Float(ahead) + lat * Float(side))
 
-    outfield = [p1, p2, p3]
-    for slot, me, marks, raw in (
-        (1, p1, opponents[0], raw_support[0]),
-        (2, p2, opponents[1], raw_support[1]),
-        (3, p3, opponents[2], raw_support[2]),
-    ):
-        has = SoccerGetBool(f"Team Player {slot} Has Ball")
-        charge = SoccerGetFloat(f"Teammate {slot} Shot Charge")
-        closest = SoccerGetBool(f"Is Team Player {slot} Closest Teammate to Ball")
-
-        mates = [p for i, p in enumerate(outfield) if i != (slot - 1)]
-        carry, shoot_now = build_carrier_move(
-            slot,
-            me,
+        mates_all = outfield + [p4]
+        mate_stams_all = [SoccerGetFloat(f"Team Player {i} Stamina") for i in range(1, 5)]
+        carry_shared, release_shared, carry_meta = build_carrier_move(
+            1,
+            carrier,
             ball,
             opp_goal,
             team_goal,
             opp_left_post,
             opp_right_post,
             opponents,
-            mates,
+            mates_all,
+            mate_stams_all,
             r_int,
             r_eff,
-            has,
-            charge,
+            team_has,
+            carrier_charge,
+            at_walk=at_walk,
+            at_debug=at_dbg,
         )
+        allow_teammate_steal = And(carrier_urgent, Not(carry_meta["kick_escape"]))
+        _recv_ok, _recv_dir, steal_target = instant_pass.best_instant_handoff(
+            carrier,
+            mates_all,
+            mate_stams_all,
+            opponents,
+            r_int,
+            carrier_stam,
+            opp_goal,
+            opp_left_post,
+            opp_right_post,
+            r_eff,
+            require_shot=Bool(False),
+        )
+        _ = (_recv_ok, _recv_dir)
+    else:
+        carrier_urgent = Bool(False)
+        allow_teammate_steal = Bool(False)
+        carry_shared = None
+        release_shared = None
+        steal_target = carrier
+        raw_support = []
+        for ahead, side in ((9.0, 7.0), (9.0, -7.0), (-6.0, 0.0)):
+            raw_support.append(ball + fwd * Float(ahead) + lat * Float(side))
+
+    # Opponent can score by walking into our mouth — shot cover cannot stop it;
+    # only a tackle can. Escalate every outfielder onto the ball when open.
+    walk_in_open, walk_pt = unopposed_walk_in(ball, left_post, right_post, team4)
+    walk_in_threat = And(opp_has, walk_in_open)
+    # Loose ball on a path into OUR net (same model as GK sprint gate).
+    goal_half_w = Abs(left_post.z)
+    shot_threat_raw, shot_threat_t, shot_threat_pt = own_goal_threat(
+        ball, ball_vel, team_goal.x, goal_half_w
+    )
+    net_shot_threat = And(loose, shot_threat_raw)
+    # Time until a walk-in carrier reaches our mouth (carrier walks).
+    walk_in_score_t = Distance(ball, walk_pt) / Float(CARRIER_SPEED)
+
+    # Tackle assignment once for the whole team (not once per outfielder).
+    duty_flags, chaser_flags, press_body = tackle_plan()
+
+    for slot, me, marks, raw in (
+        (1, p1, opponents[0], raw_support[0]),
+        (2, p2, opponents[1], raw_support[1]),
+        (3, p3, opponents[2], raw_support[2]),
+    ):
+        has = SoccerGetBool(f"Team Player {slot} Has Ball")
+        closest = SoccerGetBool(f"Is Team Player {slot} Closest Teammate to Ball")
+
+        if WITH_ANTI_TACKLE:
+            carry, shoot_now = carry_shared, release_shared
+        else:
+            mates = [p for i, p in enumerate(outfield) if i != (slot - 1)]
+            mate_stams = [
+                SoccerGetFloat(f"Team Player {i} Stamina")
+                for i in range(1, 4)
+                if i != slot
+            ]
+            mates_all_slot = mates + [p4]
+            mate_stams_all_slot = mate_stams + [SoccerGetFloat("Team Player 4 Stamina")]
+            charge = SoccerGetFloat(f"Teammate {slot} Shot Charge")
+            carry, shoot_now, _meta = build_carrier_move(
+                slot,
+                me,
+                ball,
+                opp_goal,
+                team_goal,
+                opp_left_post,
+                opp_right_post,
+                opponents,
+                mates_all_slot,
+                mate_stams_all_slot,
+                r_int,
+                r_eff,
+                has,
+                charge,
+            )
         # Defensive default: seal our assigned opponent's shot cone.
         move = threat_cover(marks, team_goal, left_post, right_post, r_int)
-        # Attacking: helpers clear ≥r_int from carrier (priority) + mates.
-        # Carrier path is never clamped — helpers yield, attacker keeps moving.
+        # Opponent carrier: interceptors chase. Presser (sacrifice/stealer) goes
+        # straight to the ball; other chasers yield ≥ r_int+hold so they cannot
+        # accidentally tackle-range the presser if the ball is aimed at them.
+        duty = duty_flags[slot - 1]
+        tackle_chase = chaser_flags[slot - 1]
         mate_anchors = [p for i, p in enumerate(outfield) if i != (slot - 1)]
+        yield_chase = positioning.clamp_support_station(
+            me, ball, mate_anchors, r_int, priority_anchor=press_body
+        )
+        chase_move = ConditionalSetVector3(duty, ball, yield_chase)
+        move = ConditionalSetVector3(And(opp_has, tackle_chase), chase_move, move)
+        # Attacking: helpers clear ≥ r_int+hold from carrier (priority) + mates.
+        # When the carrier is backing toward our goal, do not shove helpers
+        # further toward the enemy goal than the ball.
         support = positioning.clamp_support_station(
-            me, raw, mate_anchors, r_int, priority_anchor=carrier
+            me,
+            raw,
+            mate_anchors,
+            r_int,
+            priority_anchor=carrier,
+            ball=ball,
+            opp_goal=opp_goal,
+            carrier_retreating=carrier_urgent,
         )
         move = ConditionalSetVector3(And(team_has, Not(has)), support, move)
         move = ConditionalSetVector3(has, carry, move)
 
-        # Loose ball is nobody's yet. Two different situations, not one:
-        #   - our own pass in flight toward this player: no opponent is
-        #     realistically closer, so this is a controlled reception, not a
-        #     scramble. Walk to meet the ball's predicted path instead of
-        #     chasing its live position (which lags a moving ball and either
-        #     stalls the receiver in place or has him trailing it).
-        #   - a genuine 50/50 (opponent clearance, deflection, loose after a
-        #     tackle): an opponent is comparably close, so this needs the
-        #     sprint to actually win the race.
-        # Stamina IS ball retention (tackler_stam >= carrier_stam decides
-        # every duel, and sprinting is the only drain), so spending it on an
-        # uncontested reception is pure waste — exactly what let a fresher
-        # opponent tackle us straight back after a hard-won interception.
-        # Contested was inverted: it's the actual race, so it needs the lead
-        # point most, at the speed we'll really be moving (sprint, since
-        # that's what `sprint` below sets for this branch) — chasing live
-        # position here was bleeding ground to the ball in exactly the case
-        # where winning the race matters most.
+        # Teammate steal only when AT pushback and kick-pass cannot escape.
+        i_am_steal = CompareFloats(Distance(me, steal_target), Float(0.35), "<")
+        instant_steal = And(
+            And(And(team_has, Not(has)), allow_teammate_steal),
+            i_am_steal,
+        )
+
+        # Loose ball: meet at walk speed by default. Sprint is gated below —
+        # only when it is the difference between conceding and not.
         meet_point_walk = predict_ball_meet_point(me, ball, ball_vel, WALK_SPEED)
         meet_point_sprint = predict_ball_meet_point(me, ball, ball_vel, SPRINT_SPEED)
-        contested = CompareFloats(nearest_opponent_dist(opponents, ball), Distance(me, ball) * Float(1.3), "<=")
-        loose_target = ConditionalSetVector3(contested, meet_point_sprint, meet_point_walk)
+        # Sprint ONLY if walking cannot stop the ball entering OUR net and
+        # sprinting can. Two cases: goal-bound loose shot, or open walk-in.
+        d_shot = Distance(me, shot_threat_pt)
+        sprint_save_shot = And(
+            net_shot_threat,
+            And(
+                CompareFloats(d_shot / Float(WALK_SPEED), shot_threat_t, ">"),
+                CompareFloats(d_shot / Float(SPRINT_SPEED), shot_threat_t, "<="),
+            ),
+        )
+        d_ball = Distance(me, ball)
+        sprint_save_walkin = And(
+            walk_in_threat,
+            And(
+                CompareFloats(d_ball / Float(WALK_SPEED), walk_in_score_t, ">"),
+                CompareFloats(d_ball / Float(SPRINT_SPEED), walk_in_score_t, "<="),
+            ),
+        )
+        sprint = Or(sprint_save_shot, sprint_save_walkin)
+        loose_target = ConditionalSetVector3(
+            sprint_save_shot, meet_point_sprint, meet_point_walk
+        )
         move = ConditionalSetVector3(And(loose, closest), loose_target, move)
-        # Sprint ONLY on a contested loose ball. Removing sprint entirely was
-        # tested (2026-07-25) and lost 4:20 to a champion that scored 16:4 --
-        # losing the race to a 50/50 concedes possession outright, which costs
-        # far more than the stamina saved. Do not "just walk everywhere".
-        sprint = And(loose, And(closest, contested))
         debug_viz.plot_xz(f"Titanium.P{slot}.Pos", "Cyan", me)
         debug_viz.plot_xz(f"Titanium.P{slot}.Target", "Yellow", move)
         debug_viz.draw_player_move(me, move)
-        SoccerController(slot, move, sprint, player_interact(slot, has, shoot_now))
+        SoccerController(
+            slot,
+            move,
+            sprint,
+            player_interact(slot, has, shoot_now, move, sprint, instant_steal),
+        )
 
     # --- Player 4 goalkeeper ---
     h4 = SoccerGetBool("Team Player 4 Has Ball")
     c4 = SoccerGetFloat("Teammate 4 Shot Charge")
-    carrier_charge = SoccerGetFloat("Ball Carrier Shot Charge")
     move4, sprint4, interact4, gk_debug = gk_policy(
         p4,
         ball,

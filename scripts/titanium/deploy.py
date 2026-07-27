@@ -136,8 +136,14 @@ def write_candidate() -> None:
     # Always auto-deploy Titanium_test — never leave the user with a stale file.
     deploy_test_copies(out_path.read_text(encoding="utf-8"))
 
-    if WITH_ANTI_TACKLE:
+    # Promotion gate hits cargo headless many times — opt-in only. Graph build
+    # itself is Python→JSON and must not drag a simulator compile/test loop.
+    if WITH_ANTI_TACKLE and ("--gate" in sys.argv or "--promote" in sys.argv):
         _run_promotion_test()
+    elif WITH_ANTI_TACKLE:
+        print(
+            "\n(skipping promotion gate — pass --gate to run champion/challenger tests)\n"
+        )
 
 
 def _run_promotion_test() -> None:
@@ -161,8 +167,8 @@ def promote_if_requested() -> None:
         return
     if "--promote" not in sys.argv:
         print(
-            "\nChallenger builds run promote_pipeline.py automatically.\n"
-            "Manual --promote on straight-walk builds skips the tournament."
+            "\nStraight-walk: pass --promote to copy candidate → live Titanium.\n"
+            "AT challenger: pass --gate to run cargo headless promotion matches."
         )
         return
 
