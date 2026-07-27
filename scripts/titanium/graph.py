@@ -18,7 +18,7 @@ from titanium.ball_physics import (
     predict_ball_meet_point,
 )
 from titanium.goalkeeper import gk_policy, threat_cover
-from titanium.tackle import player_interact, tackle_plan
+from titanium.tackle import held_ball_cutoff, player_interact, tackle_plan
 from titanium import debug_viz, positioning
 from titanium import support_outlets
 
@@ -355,10 +355,11 @@ def build() -> None:
             me, move, peer_bodies, peer_pris, my_pri, r_int
         )
         move = ConditionalSetVector3(opp_has, cover_resolved, move)
+        cutoff = held_ball_cutoff(me, ball, ball_vel, r_int)
         yield_chase = positioning.resolve_space_claims(
-            me, ball, peer_bodies, peer_pris, my_pri, r_int
+            me, cutoff, peer_bodies, peer_pris, my_pri, r_int
         )
-        chase_move = ConditionalSetVector3(duty, ball, yield_chase)
+        chase_move = ConditionalSetVector3(duty, cutoff, yield_chase)
         move = ConditionalSetVector3(And(opp_has, tackle_chase), chase_move, move)
         # Attacking outlets: mild equal-role spread; collapse toward carrier
         # when AT demands an emergency handoff.

@@ -2,8 +2,22 @@
 from __future__ import annotations
 
 from titanium._env import *  # noqa: F401,F403
-from titanium.constants import CARRIER_SPEED, FIXED_DT, SPRINT_SPEED, WALK_SPEED
+from titanium.constants import (
+    CARRIER_SPEED,
+    FIXED_DT,
+    PITCH_X_MAX,
+    PITCH_X_MIN,
+    PITCH_Z_MAX,
+    PITCH_Z_MIN,
+    SPRINT_SPEED,
+    WALK_SPEED,
+)
 from titanium.geometry import closest_point_on_goal_mouth, pos, unit_or_zero
+
+
+HELD_CUTOFF_SAMPLES = 12
+HELD_CUTOFF_STRIDE_TICKS = 10
+HELD_CUTOFF_FALLBACK_TICKS = 160
 
 
 def _xz_dist(a, b):
@@ -56,6 +70,39 @@ def _intercept_time(me, ball, r_int):
     gap = Distance(me, ball) - r_int
     gap = ConditionalSetFloat(CompareFloats(gap, Float(0), "<"), Float(0), gap)
     return gap / Float(WALK_SPEED)
+
+
+def held_ball_cutoff(me, ball, ball_vel, r_int):
+    """Earliest sampled point on a held ball's XZ path reachable on foot.
+
+    This is StarCheese's graph-feasible held-ball interception solve: while
+    held, Ball Velocity is the carrier velocity and has zero deceleration.
+    Twelve samples span the next 2.09 seconds; if none is reachable, chase the
+    3.04-second fallback. Selection runs latest-to-earliest so the earliest
+    reachable sample is the final ConditionalSetVector3 winner.
+    """
+    start = Vector3(ball.x, Float(0), ball.z)
+    velocity = Vector3(ball_vel.x, Float(0), ball_vel.z)
+
+    def at_time(t):
+        p = start + velocity * Float(t)
+        return Vector3(
+            ClampFloat(p.x, Float(PITCH_X_MIN), Float(PITCH_X_MAX)),
+            Float(0),
+            ClampFloat(p.z, Float(PITCH_Z_MIN), Float(PITCH_Z_MAX)),
+        )
+
+    best = at_time(HELD_CUTOFF_FALLBACK_TICKS * FIXED_DT)
+    for k in range(HELD_CUTOFF_SAMPLES - 1, -1, -1):
+        t = k * HELD_CUTOFF_STRIDE_TICKS * FIXED_DT
+        projected = start + velocity * Float(t)
+        reachable = CompareFloats(
+            _xz_dist(projected, me),
+            Float(WALK_SPEED * t) + r_int,
+            "<=",
+        )
+        best = ConditionalSetVector3(reachable, at_time(t), best)
+    return best
 
 
 def _cheapest_among(mask, key, me):
