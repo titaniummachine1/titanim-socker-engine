@@ -35,7 +35,7 @@ def t_formation_stations(carrier, opp_goal, r_int):
         pitch / 40 units away), capped at 4*r_int. Near the goal the
         flankers collapse in tight (tackle distance); at midfield they
         spread wide for passing lanes.
-      - rear:  4 * r_int behind the carrier (toward own goal)
+      - rear:  2 * r_int ahead of carrier (second-row attacker, pushing forward)
 
     The formation rotates with the attack direction, so "left" and "right"
     are always relative to the line from carrier to opponent goal.
@@ -50,7 +50,7 @@ def t_formation_stations(carrier, opp_goal, r_int):
 
     left = carrier + lat * (flank_scale * r_int)
     right = carrier + lat * (Float(0) - flank_scale * r_int)
-    rear = carrier + fwd * (Float(0) - Float(4.0) * r_int)
+    rear = carrier + fwd * (Float(2.0) * r_int)  # push forward, not back
 
     return left, right, rear
 
