@@ -61,13 +61,15 @@ def _can_tackle_us(opp_stam, my_stam):
 
 
 @cache
-def _rotate_away_from_opp(me, end_pos, opp, r_eff):
+def _rotate_away_from_opp(me, end_pos, opp, r_eff, attack_dir=None):
     """If `end_pos` is inside `opp`'s radius `r_eff`, rotate the displacement
     vector (end_pos - me) so the tip lands on the circle boundary.
 
     Circle-circle intersection: carrier moves on a circle of radius `step`
     around `me`; we want the point on that circle at distance `r_eff` from
-    `opp`. Pick the intersection closest to the original `end_pos` direction.
+    `opp`. Pick the intersection with more forward progress toward
+    `attack_dir` (away from own goal). If `attack_dir` is None, fall back to
+    closest to original end_pos.
 
     Returns the adjusted end position (unchanged if not inside the circle).
     """
@@ -106,10 +108,18 @@ def _rotate_away_from_opp(me, end_pos, opp, r_eff):
     cand_a = midpoint + offset
     cand_b = midpoint - offset
 
-    # Pick the one closer to the original end_pos
-    dist_a = Distance(cand_a, end_pos)
-    dist_b = Distance(cand_b, end_pos)
-    prefer_a = CompareFloats(dist_a, dist_b, "<=")
+    if attack_dir is not None:
+        # Prefer the candidate with more forward progress (away from own goal).
+        # Walking into own goal is just as bad as getting tackled.
+        prog_a = DotProduct(unit_or_zero(cand_a - me), attack_dir)
+        prog_b = DotProduct(unit_or_zero(cand_b - me), attack_dir)
+        prefer_a = CompareFloats(prog_a, prog_b, ">=")
+    else:
+        # Fallback: pick the one closer to the original end_pos
+        dist_a = Distance(cand_a, end_pos)
+        dist_b = Distance(cand_b, end_pos)
+        prefer_a = CompareFloats(dist_a, dist_b, "<=")
+
     rotated = ConditionalSetVector3(prefer_a, cand_a, cand_b)
 
     # Only apply rotation when inside; otherwise keep original
@@ -129,15 +139,21 @@ def _rotate_away_from_opp_dir(me, direction, step_len, opp, r_eff):
     return adjusted_dir, inside
 
 
-def _displacement_walk(me, desired_dir, opponents, staminas, r_int, my_stam, step_len):
+def _displacement_walk(me, desired_dir, opponents, staminas, r_int, my_stam, step_len, attack_dir=None):
     """Compute walk direction by simulating movement and rotating away from
     any opponent whose interaction circle the end position falls inside.
 
     Chains over opponents: adjust for opp1, then check opp2 against adjusted
     position, etc. Only stam-capable opponents steer the walk.
+
+    If `attack_dir` is provided, rotations bias toward forward progress —
+    walking into your own goal is treated as equally bad as getting tackled.
+    After all rotations, if the final direction retreats (negative dot with
+    attack_dir) but the original was forward, revert to the original direction.
     """
     r_eff = r_int + Float(AT_TOLERANCE)
-    end_pos = me + desired_dir * step_len
+    original_end = me + desired_dir * step_len
+    end_pos = original_end
 
     any_adjusted = Bool(False)
     for opp, stam in zip(opponents, staminas):
@@ -146,17 +162,28 @@ def _displacement_walk(me, desired_dir, opponents, staminas, r_int, my_stam, ste
         opp_end = step_toward(opp, me, _WALK, _DT)
         end_to_opp = Distance(end_pos, opp_end)
         inside = And(capable, CompareFloats(end_to_opp, r_eff, "<="))
-        adjusted = _rotate_away_from_opp(me, end_pos, opp_end, r_eff)
+        adjusted = _rotate_away_from_opp(me, end_pos, opp_end, r_eff, attack_dir)
         end_pos = ConditionalSetVector3(inside, adjusted, end_pos)
         any_adjusted = Or(any_adjusted, inside)
 
     final_dir = unit_or_zero(end_pos - me)
+
+    # Own-goal guard: if the rotated direction retreats but the original was
+    # forward, getting tackled is better than walking into our own goal.
+    # Revert to the original desired direction.
+    if attack_dir is not None:
+        original_forward = CompareFloats(DotProduct(desired_dir, attack_dir), Float(0), ">=")
+        final_retreats = CompareFloats(DotProduct(final_dir, attack_dir), Float(0), "<")
+        revert = And(any_adjusted, And(original_forward, final_retreats))
+        final_dir = ConditionalSetVector3(revert, desired_dir, final_dir)
+        end_pos = ConditionalSetVector3(revert, original_end, end_pos)
+
     return final_dir, any_adjusted
 
 
-def _any_forward_walk(me, desired_dir, opponents, staminas, r_int, my_stam, step_len):
+def _any_forward_walk(me, desired_dir, opponents, staminas, r_int, my_stam, step_len, attack_dir=None):
     """True if the displacement-rotated walk still makes forward progress."""
-    final_dir, _ = _displacement_walk(me, desired_dir, opponents, staminas, r_int, my_stam, step_len)
+    final_dir, _ = _displacement_walk(me, desired_dir, opponents, staminas, r_int, my_stam, step_len, attack_dir)
     progress = DotProduct(final_dir, desired_dir)
     return CompareFloats(progress, Float(0), ">=")
 
@@ -302,9 +329,12 @@ def search_safe_direction(
     opp_goal = desired
     step_len = Float(move_step)
 
-    # Core: displacement rotation away from opponents
+    # Attack direction for own-goal-aware rotation
+    attack_dir = unit_or_zero(opp_goal - me)
+
+    # Core: displacement rotation away from opponents (bias toward attack dir)
     best_dir, any_adjusted = _displacement_walk(
-        me, desired_dir, opponents, staminas, r_int, my_stam, step_len
+        me, desired_dir, opponents, staminas, r_int, my_stam, step_len, attack_dir
     )
     # If no adjustment was needed, best_dir is the same as desired_dir
     any_open = Not(any_adjusted)
@@ -313,7 +343,7 @@ def search_safe_direction(
     any_open = Or(any_open, any_adjusted)
 
     any_forward = _any_forward_walk(
-        me, desired_dir, opponents, staminas, r_int, my_stam, step_len
+        me, desired_dir, opponents, staminas, r_int, my_stam, step_len, attack_dir
     )
 
     # Probes for support outlets (five fixed offsets, same as before)
@@ -341,8 +371,9 @@ def search_safe_direction(
     # Tick+1 foresight: from predicted end state, check forward progress
     opp_ends = [step_toward(opp, me, _WALK, _DT) for opp in opponents]
     desired_next = unit_or_zero(opp_goal - me_end)
+    attack_dir_next = unit_or_zero(opp_goal - me_end)
     any_forward_next = _any_forward_walk(
-        me_end, desired_next, opp_ends, staminas, r_int, my_stam, step_len
+        me_end, desired_next, opp_ends, staminas, r_int, my_stam, step_len, attack_dir_next
     )
 
     trapped_now = Not(any_forward)

@@ -21,6 +21,7 @@ from titanium.goalkeeper import gk_policy, threat_cover
 from titanium.tackle import held_ball_cutoff, player_interact, tackle_plan
 from titanium import debug_viz, positioning
 from titanium import support_outlets
+from titanium import formation
 
 
 # Own goal line. Faceoff coordinates are world absolute, so this is a distance
@@ -201,26 +202,14 @@ def build() -> None:
             team_has,
             Or(at_dbg["need_pass"], Or(at_dbg["own_goal_push"], at_dbg["retreating"])),
         )
-        weak_z = support_outlets.lower_density_flank_z(opponents)
-        left_o, right_o, trail_o = support_outlets.at_safe_flank_stations(
-            carrier,
-            ball,
-            opp_goal,
-            opp_left_post,
-            opp_right_post,
-            team_goal,
-            opponents,
-            r_int,
-            r_eff,
-            carrier_stam,
-            danger=_c_danger,
-            at_debug=at_dbg,
-            weak_z=weak_z,
+        # T-formation stations: 3*r_int left, 3*r_int right, 4*r_int behind carrier
+        t_left, t_right, t_rear = formation.t_formation_stations(
+            carrier, opp_goal, r_int
         )
-        raw_support = [left_o, right_o, trail_o]
-        debug_viz.plot_xz("Titanium.Support.Left", "Yellow", left_o)
-        debug_viz.plot_xz("Titanium.Support.Right", "Yellow", right_o)
-        debug_viz.plot_xz("Titanium.Support.Trail", "Yellow", trail_o)
+        raw_support = [t_left, t_right, t_rear]
+        debug_viz.plot_xz("Titanium.Support.Left", "Yellow", t_left)
+        debug_viz.plot_xz("Titanium.Support.Right", "Yellow", t_right)
+        debug_viz.plot_xz("Titanium.Support.Trail", "Yellow", t_rear)
 
         mates_all = outfield + [p4]
         mate_stams_all = [SoccerGetFloat(f"Team Player {i} Stamina") for i in range(1, 5)]
@@ -268,9 +257,10 @@ def build() -> None:
         carry_shared = None
         release_shared = None
         steal_target = carrier
-        raw_support = []
-        for ahead, side in ((9.0, 7.0), (9.0, -7.0), (-6.0, 0.0)):
-            raw_support.append(ball + fwd * Float(ahead) + lat * Float(side))
+        t_left, t_right, t_rear = formation.t_formation_stations(
+            carrier, opp_goal, r_int
+        )
+        raw_support = [t_left, t_right, t_rear]
 
     # Opponent can score by walking into our mouth — shot cover cannot stop it;
     # only a tackle can. Escalate every outfielder onto the ball when open.

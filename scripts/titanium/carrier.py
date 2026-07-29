@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from titanium._env import *  # noqa: F401,F403
-from titanium.constants import FULL_CHARGE, KEEP_BALL_DANGER_PENALTY
+from titanium.constants import FULL_CHARGE, KEEP_BALL_DANGER_PENALTY, GOAL_HALF_WIDTH
 from titanium.shot import best_escape_pass, clear_shot, walk_target
 
 
@@ -31,10 +31,18 @@ def build_carrier_move(
     Pass shared `at_walk` / `at_debug` from one `carrier_walk_target` so the
     graph does not rebuild anti-tackle once per outfielder.
     """
-    from titanium import anti_tackle, debug_viz, instant_pass, positioning
+    from titanium import anti_tackle, debug_viz, formation, instant_pass, positioning
     from titanium._env import WITH_ANTI_TACKLE  # noqa: F401
 
     my_stam = SoccerGetFloat("Ball Carrier Stamina")
+
+    # Auto-score override: if close enough to opponent goal, ignore AT and drive
+    # straight at the goal. AT may be rotating us away from a scoring chance —
+    # when we're this close, scoring is more important than ball retention.
+    dist_to_opp_goal = Distance(me, opp_goal)
+    close_to_goal = CompareFloats(dist_to_opp_goal, Float(GOAL_HALF_WIDTH * 2.0), "<=")
+    in_scoring_range = And(has_ball, close_to_goal)
+    score_walk = walk_target(me, opp_goal)
 
     aimable = anti_tackle.aim_is_safe(me, opponents, r_int, my_stam)
 
@@ -70,8 +78,11 @@ def build_carrier_move(
         at_debug = None
         urgent = danger
 
-    can_pass, pass_dir, _pass_mate = best_escape_pass(
-        me, mates, opponents, r_eff, direction_ok=aimable
+    # Coverage-based pass: pass to furthest-forward open teammate who can
+    # receive without interception. Only pass if teammate is less covered
+    # than the carrier.
+    can_pass, pass_dir, _pass_mate, _pass_cov = formation.best_formation_pass(
+        me, mates, opponents, opp_goal, r_int, r_eff, my_stam, direction_ok=aimable
     )
     # Kick can still get the ball out → never teammate-tackle.
     kick_escape = And(ready, can_pass)
@@ -124,6 +135,9 @@ def build_carrier_move(
     move = ConditionalSetVector3(pass_now, pass_to, move)
     move = ConditionalSetVector3(instant_now, inst_to, move)
     move = ConditionalSetVector3(walk_in_now, walk_in_target, move)
+    # Auto-score: override everything (including AT) when in scoring range.
+    # Walk straight at the opponent goal — never at our own goal.
+    move = ConditionalSetVector3(in_scoring_range, score_walk, move)
     chase = walk_target(me, ball, step=8.0)
     move = ConditionalSetVector3(has_ball, move, chase)
     return move, release_now, {
