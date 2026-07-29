@@ -82,7 +82,7 @@ def build_carrier_move(
     # receive without interception. Only pass if teammate is less covered
     # than the carrier.
     can_pass, pass_dir, _pass_mate, _pass_cov = formation.best_formation_pass(
-        me, mates, opponents, opp_goal, r_int, r_eff, my_stam, direction_ok=aimable
+        me, mates, opponents, opp_goal, r_int, r_eff, my_stam
     )
     # Kick can still get the ball out → never teammate-tackle.
     kick_escape = And(ready, can_pass)
@@ -107,10 +107,9 @@ def build_carrier_move(
     )
 
     if WITH_ANTI_TACKLE:
-        want_pass = Or(urgent, danger)
         pass_now = And(
             has_ball,
-            And(ready, And(can_pass, And(want_pass, And(Not(shoot_now), Not(instant_now))))),
+            And(ready, And(can_pass, And(Not(shoot_now), Not(instant_now)))),
         )
         at_debug = dict(at_debug)
         at_debug["pass_danger"] = danger

@@ -181,10 +181,10 @@ def build() -> None:
     # Defending outlets: when opponent has ball, 2 flankers stay forward as
     # outlets anchored on the ball (not the team carrier which defaults to GK).
     # Only slot 3 (trail) stays back on threat_cover.
-    # Flank distance scales: 1*r_int near opp goal, 4*r_int at half pitch.
+    # Flank distance scales: 1*r_int near own goal, 4*r_int at half pitch.
     def_fwd = unit_or_zero(opp_goal - ball)
     def_lat = Vector3(Float(0) - def_fwd.z, Float(0), def_fwd.x)
-    def_dist = Distance(ball, opp_goal)
+    def_dist = Distance(ball, team_goal)
     def_frac = ClampFloat(def_dist / Float(40.0), Float(0.0), Float(1.0))
     def_scale = Float(1.0) + Float(3.0) * def_frac
     def_left = ball + def_lat * (def_scale * r_int)
@@ -217,7 +217,7 @@ def build() -> None:
         )
         # T-formation stations: 3*r_int left, 3*r_int right, 4*r_int behind carrier
         t_left, t_right, t_rear = formation.t_formation_stations(
-            carrier, opp_goal, r_int
+            carrier, opp_goal, r_int, team_goal
         )
         raw_support = [t_left, t_right, t_rear]
         debug_viz.plot_xz("Titanium.Support.Left", "Yellow", t_left)
@@ -271,7 +271,7 @@ def build() -> None:
         release_shared = None
         steal_target = carrier
         t_left, t_right, t_rear = formation.t_formation_stations(
-            carrier, opp_goal, r_int
+            carrier, opp_goal, r_int, team_goal
         )
         raw_support = [t_left, t_right, t_rear]
 
@@ -366,18 +366,14 @@ def build() -> None:
         my_pri = move_pris[slot - 1]
         peer_bodies = [all_bodies[i] for i in range(4) if i != (slot - 1)]
         peer_pris = [move_pris[i] for i in range(4) if i != (slot - 1)]
-        # Cover also soft-resolves vs press so shot-angle doesn't sit on the
-        # intercept route (utility, not collision).
+        # Space claims only when team has the ball. When defending, players
+        # freely overlap — no resolve.
         cover_resolved = positioning.resolve_space_claims(
             me, move, peer_bodies, peer_pris, my_pri, r_int
         )
-        move = ConditionalSetVector3(opp_has, cover_resolved, move)
+        move = ConditionalSetVector3(team_has, cover_resolved, move)
         cutoff = held_ball_cutoff(me, ball, ball_vel, r_int)
-        yield_chase = positioning.resolve_space_claims(
-            me, cutoff, peer_bodies, peer_pris, my_pri, r_int
-        )
-        chase_move = ConditionalSetVector3(duty, cutoff, yield_chase)
-        move = ConditionalSetVector3(And(opp_has, tackle_chase), chase_move, move)
+        move = ConditionalSetVector3(And(opp_has, tackle_chase), cutoff, move)
         # When defending, non-defender outfielders push forward as flank outlets.
         # Only slot 3 stays back on threat_cover; slots 1-2 stay forward ready
         # to receive when we win the ball.
