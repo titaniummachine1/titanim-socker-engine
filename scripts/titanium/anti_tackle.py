@@ -25,7 +25,7 @@ from titanium.constants import (
     KEEP_BALL_DANGER_PENALTY,
     WALK_SPEED,
 )
-from titanium.geometry import rotate_xz, unit_or_zero
+from titanium.geometry import rotate_xz, unit_or_zero, nearest_safe_direction, opponent_half_angle, opponent_invariants, opponent_tangents, is_legal_direction
 from titanium import positioning
 
 # Tolerance added to interaction radius so we don't sit exactly at the limit.
@@ -140,43 +140,59 @@ def _rotate_away_from_opp_dir(me, direction, step_len, opp, r_eff):
 
 
 def _displacement_walk(me, desired_dir, opponents, staminas, r_int, my_stam, step_len, attack_dir=None):
-    """Compute walk direction by simulating movement and rotating away from
-    any opponent whose interaction circle the end position falls inside.
+    """Compute walk direction by preemptively steering around opponents
+    using tangent geometry — the same left/right tangent directions we
+    use for shot legality.
 
-    Chains over opponents: adjust for opp1, then check opp2 against adjusted
-    position, etc. Only stam-capable opponents steer the walk.
+    For each stam-capable opponent, compute the left and right tangent
+    directions from `me` around their interaction circle. Then pick the
+    direction closest to `desired_dir` that clears all opponent cones.
 
-    If `attack_dir` is provided, rotations bias toward forward progress —
-    walking into your own goal is treated as equally bad as getting tackled.
-    After all rotations, if the final direction retreats (negative dot with
-    attack_dir) but the original was forward, revert to the original direction.
+    This is proactive: we never aim INTO an opponent's circle in the
+    first place, instead of reacting after we're already inside.
+
+    If `attack_dir` is provided, the tangent choice biases toward
+    forward progress (away from own goal). If the only safe direction
+    retreats toward own goal, revert to the original direction —
+    getting tackled is better than scoring an own goal.
     """
     r_eff = r_int + Float(AT_TOLERANCE)
-    original_end = me + desired_dir * step_len
-    end_pos = original_end
 
-    any_adjusted = Bool(False)
+    # Build opponent cones from ME's position (not ball) — we're walking,
+    # not shooting. Use predicted opp positions (they step toward us).
+    ghost_opponents = []
     for opp, stam in zip(opponents, staminas):
         capable = _can_tackle_us(stam, my_stam)
-        # Predicted opponent position after this tick (they step toward us)
         opp_end = step_toward(opp, me, _WALK, _DT)
-        end_to_opp = Distance(end_pos, opp_end)
-        inside = And(capable, CompareFloats(end_to_opp, r_eff, "<="))
-        adjusted = _rotate_away_from_opp(me, end_pos, opp_end, r_eff, attack_dir)
-        end_pos = ConditionalSetVector3(inside, adjusted, end_pos)
-        any_adjusted = Or(any_adjusted, inside)
+        # Ghost low-stam opponents by replacing them far away
+        ghosted = ConditionalSetVector3(
+            capable, opp_end, Vector3(Float(1e6), Float(0), Float(1e6))
+        )
+        ghost_opponents.append(ghosted)
 
-    final_dir = unit_or_zero(end_pos - me)
+    # Use nearest_safe_direction: computes tangents around each opponent
+    # and picks the legal direction closest to desired.
+    desired_target = me + desired_dir * Float(10)
+    safe_dir = nearest_safe_direction(me, desired_target, ghost_opponents, r_eff)
 
-    # Own-goal guard: if the rotated direction retreats but the original was
+    # Check if any adjustment was needed (desired direction blocked)
+    half_angles = [opponent_half_angle(o, me, r_eff) for o in ghost_opponents]
+    invariants = [
+        opponent_invariants(o, me, r_eff, ha)
+        for o, ha in zip(ghost_opponents, half_angles)
+    ]
+    desired_blocked = Not(is_legal_direction(desired_dir, invariants))
+    any_adjusted = desired_blocked
+
+    final_dir = safe_dir
+
+    # Own-goal guard: if the safe direction retreats but the original was
     # forward, getting tackled is better than walking into our own goal.
-    # Revert to the original desired direction.
     if attack_dir is not None:
         original_forward = CompareFloats(DotProduct(desired_dir, attack_dir), Float(0), ">=")
         final_retreats = CompareFloats(DotProduct(final_dir, attack_dir), Float(0), "<")
         revert = And(any_adjusted, And(original_forward, final_retreats))
         final_dir = ConditionalSetVector3(revert, desired_dir, final_dir)
-        end_pos = ConditionalSetVector3(revert, original_end, end_pos)
 
     return final_dir, any_adjusted
 
