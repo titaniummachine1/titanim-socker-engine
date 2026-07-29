@@ -207,8 +207,9 @@ def best_formation_pass(
     best_d_to_goal = ConditionalSetFloat(any_open_ok, open_best_d, best_d_to_goal)
     best_cov = ConditionalSetFloat(any_open_ok, open_best_cov, best_cov)
 
-    # Pass when carrier is covered and a clear lane exists.
+    # Pass when carrier is covered, or when carrier can't shoot but a
+    # teammate who can shoot is available.
     carrier_covered = CompareFloats(carrier_cov, Float(0.0), ">")
-    should_pass = And(any_ok, carrier_covered)
+    should_pass = And(any_ok, Or(carrier_covered, any_shooter_ok))
 
     return should_pass, best_dir, best_mate, best_cov

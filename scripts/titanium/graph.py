@@ -34,9 +34,8 @@ GK_FROM_GOAL = 10.0
 # clearance (Test1/Test2 probes, 2026-07-26). Standing here already means the
 # push is a no-op and the shape survives the whistle intact.
 CIRCLE_STANDOFF = 7.75
-# Wall gap either side of the middle player. Bodies are 0.655 radius, so this
-# is a shade over two body widths — a wall, not a pile.
-WALL_SPACING = 3.0
+# Kickoff flank spacing — 2x interaction radius either side of the ball.
+KICKOFF_FLANK = 6.0
 
 
 def _faceoff_spots():
@@ -76,14 +75,14 @@ def _faceoff_spots():
 
     ours = SoccerGetBool("Is Team Kicking off")
 
-    def wall(z):
-        """Same wall slot, on the ball when kicking / on the arc when not."""
+    def flank(z):
+        """Flanker spot: on the ball when kicking / on the arc when not."""
         return ConditionalSetVector3(ours, spot(0.0, z), spot(CIRCLE_STANDOFF, z))
 
     return (
-        wall(0.0),
-        wall(-WALL_SPACING),
-        wall(WALL_SPACING),
+        flank(0.0),
+        flank(-KICKOFF_FLANK),
+        flank(KICKOFF_FLANK),
         spot(GOAL_LINE_X - GK_FROM_GOAL, 0.0),
     )
 

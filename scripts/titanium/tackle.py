@@ -247,16 +247,30 @@ def player_interact(
     handoff steal (`instant_steal`) — never voluntary teammate tackles.
     """
     _ = (move, sprint)
-    hold_charge = And(has_ball, Not(shoot_now))
-    team_has = SoccerGetBool("Team Has Ball")
-    want_spam = And(Not(has_ball), Not(team_has))
-
     t = SoccerGetFloat("Current Simulation Time")
     dt = SoccerGetFloat("Fixed Delta Time")
     dt_safe = ConditionalSetFloat(CompareFloats(dt, Float(1e-6), "<"), Float(1e-6), dt)
     tick = Floor(t / dt_safe)
-    half = Floor(tick * Float(0.5))
-    odd_tick = CompareFloats(tick - half * Float(2), Float(0.5), ">")
-    press = And(want_spam, odd_tick)
-    steal = Bool(False) if instant_steal is None else And(instant_steal, odd_tick)
+    # 6-tick cycle: 5 ticks pressed, 1 tick released.  Gives the engine
+    # enough time to register charge > 0 before the next release.
+    cycle = tick - Floor(tick * Float(1.0 / 6.0)) * Float(6.0)
+    release_tick = CompareFloats(cycle, Float(5.0), ">=")
+
+    # Engine interact state machine:
+    #   1. Press interact → pickup/tackle (rising edge, fires once)
+    #   2. Release + repress → start charging kick
+    #   3. Hold → charge builds (can hold indefinitely)
+    #   4. Release → kick
+    # If we hold continuously from pickup, the engine never sees the
+    # release+repress, so charging never starts.  Oscillate the button
+    # on a 3-tick cycle while charge is 0 to generate the edge, then
+    # hold steady once charging is underway.
+    charge = SoccerGetFloat(f"Teammate {player} Shot Charge")
+    charging = CompareFloats(charge, Float(0.0), ">")
+    hold_charge = And(has_ball, And(Not(shoot_now), Or(charging, Not(release_tick))))
+    team_has = SoccerGetBool("Team Has Ball")
+    want_spam = And(Not(has_ball), Not(team_has))
+
+    press = And(want_spam, Not(release_tick))
+    steal = Bool(False) if instant_steal is None else And(instant_steal, Not(release_tick))
     return Or(hold_charge, Or(press, steal))
