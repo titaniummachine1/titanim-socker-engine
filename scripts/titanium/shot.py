@@ -1,5 +1,15 @@
 """Shot legality and walking: is there a clean lane right now, and how we
-move toward a target (straight line — dodge logic lives in anti_tackle)."""
+move toward a target (straight line — dodge logic lives in anti_tackle).
+
+Opponent interception circle optimization: for each opponent, compute the
+left-most and right-most tangent directions to their interception radius
+circle (same tangent-circle construction as post tangents). A shot direction
+that falls BETWEEN these two tangent angles is intercepted; a direction
+OUTSIDE them is clear of that opponent. These tangent directions are also
+used as fallback shot candidates — if the three primary candidates (center,
+left post, right post) are all blocked, we try grazing past the opponent
+circles, picking the legal direction closest to the goal-center line.
+"""
 from __future__ import annotations
 
 from titanium._env import *  # noqa: F401,F403
@@ -9,6 +19,7 @@ from titanium.geometry import (
     is_legal_direction,
     opponent_half_angle,
     opponent_invariants,
+    opponent_tangents,
     post_tangent,
     unit_or_zero,
 )
@@ -27,42 +38,44 @@ def clear_shot(
     """Is there a legal straight-line lane into the enemy goal right now, and
     along which direction?
 
-    Candidates are the three directions that actually score: straight at the
-    goal centre, and the two post-tangent cone edges — the true min/max angle
-    corrected for post+ball radius, since a ball aimed at the raw corner
-    clips the post instead of going in. A candidate counts only if it also
-    clears every opponent's forbidden cone, so the lane is genuinely open
-    rather than merely goal-ward.
+    Candidate priority (first legal wins):
+
+    1. **Center** — straight at the goal centre (largest margin for error).
+    2. **Left post tangent** — true max-angle edge corrected for post+ball
+       radius.
+    3. **Right post tangent** — true min-angle edge.
+    4. **Opponent tangent fallbacks** — for each opponent, the left and right
+       tangent directions to their interception radius circle (same
+       tangent-circle construction as posts). These are the directions that
+       graze just past the opponent's reach, picked closest to the goal-center
+       line among legal ones.
 
     ALL opponents count here (including exhausted ones): a released ball is
     loose and anyone can pick it up. Anti-tackle/dribble ghosts low-stam
     bodies; shooting must not.
 
-    Centre is preferred whenever it is legal (largest margin for error); the
-    tangents are the fallback for when somebody is standing in the middle.
-
     `direction_ok` is an optional extra test applied per candidate. The
     anti-tackle build passes one: aiming a direction turns the carrier, which
     parks the held ball along that direction, so a lane that is geometrically
     open is still worthless if the ball gets taken the moment you point at it.
-    Rejecting those here means the whole shot cone can be ruled out when every
-    angle between the two post tangents is covered by a tackler.
 
     Returns `(lane_open, aim_direction)`.
     """
     dir_c = unit_or_zero(opp_goal - shot_origin)
     dir_l, _ = post_tangent(shot_origin, opp_left_post, POST_AIM_RADIUS)
     dir_r, _ = post_tangent(shot_origin, opp_right_post, POST_AIM_RADIUS)
+
+    half_angles = [opponent_half_angle(o, shot_origin, r_eff) for o in opponents]
     invariants = [
-        opponent_invariants(o, shot_origin, r_eff, opponent_half_angle(o, shot_origin, r_eff))
-        for o in opponents
+        opponent_invariants(o, shot_origin, r_eff, ha)
+        for o, ha in zip(opponents, half_angles)
     ]
+
     def viable(cand):
-        """Lane is clear AND — if a caller supplied one — the carrier can
-        actually aim this way. See `direction_ok` in the docstring."""
         legal = is_legal_direction(cand, invariants)
         return legal if direction_ok is None else And(legal, direction_ok(cand))
 
+    # Primary candidates: Center -> Left Post -> Right Post
     best = dir_c
     ok = viable(dir_c)
     for cand in (dir_l, dir_r):
@@ -70,6 +83,19 @@ def clear_shot(
         take = And(legal, Not(ok))
         best = ConditionalSetVector3(take, cand, best)
         ok = Or(ok, legal)
+
+    # Fallback: opponent tangent directions (graze past interception circles)
+    # Same logic as post tangents — left/right tangent to each opponent's
+    # interception radius circle. Only tried when all 3 primary candidates
+    # are blocked. Among legal fallbacks, prefer closest to goal-center line.
+    for opp, ha in zip(opponents, half_angles):
+        tang_l, tang_r = opponent_tangents(opp, shot_origin, ha)
+        for cand in (tang_l, tang_r):
+            legal = viable(cand)
+            take = And(legal, Not(ok))
+            best = ConditionalSetVector3(take, cand, best)
+            ok = Or(ok, legal)
+
     return ok, best
 
 
