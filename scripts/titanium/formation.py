@@ -31,8 +31,8 @@ def t_formation_stations(carrier, opp_goal, r_int):
     """T-formation stations relative to the carrier.
 
     Returns (left, right, rear) positions:
-      - left:  3 * r_int to the carrier's left (perpendicular to attack dir)
-      - right: 3 * r_int to the carrier's right
+      - left:  4 * r_int to the carrier's left (perpendicular to attack dir)
+      - right: 4 * r_int to the carrier's right
       - rear:  4 * r_int behind the carrier (toward own goal)
 
     The formation rotates with the attack direction, so "left" and "right"
@@ -41,8 +41,8 @@ def t_formation_stations(carrier, opp_goal, r_int):
     fwd = unit_or_zero(opp_goal - carrier)
     lat = Vector3(Float(0) - fwd.z, Float(0), fwd.x)
 
-    left = carrier + lat * (Float(3.0) * r_int)
-    right = carrier + lat * (Float(0) - Float(3.0) * r_int)
+    left = carrier + lat * (Float(4.0) * r_int)
+    right = carrier + lat * (Float(0) - Float(4.0) * r_int)
     rear = carrier + fwd * (Float(0) - Float(4.0) * r_int)
 
     return left, right, rear
@@ -163,8 +163,9 @@ def best_formation_pass(
     best_d_to_goal = ConditionalSetFloat(any_open_ok, open_best_d, any_best_d)
     best_cov = ConditionalSetFloat(any_open_ok, open_best_cov, any_best_cov)
 
-    # Only pass if a teammate is less covered than the carrier
-    mate_less_covered = CompareFloats(best_cov, carrier_cov, "<")
-    should_pass = And(any_ok, mate_less_covered)
+    # Pass whenever carrier is covered (coverage > 0) and a clear lane exists.
+    # Only keep the ball when carrier is fully open (coverage = 0).
+    carrier_covered = CompareFloats(carrier_cov, Float(0.0), ">")
+    should_pass = And(any_ok, carrier_covered)
 
     return should_pass, best_dir, best_mate, best_cov
