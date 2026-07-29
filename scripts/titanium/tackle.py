@@ -251,10 +251,11 @@ def player_interact(
     dt = SoccerGetFloat("Fixed Delta Time")
     dt_safe = ConditionalSetFloat(CompareFloats(dt, Float(1e-6), "<"), Float(1e-6), dt)
     tick = Floor(t / dt_safe)
-    # 6-tick cycle: 5 ticks pressed, 1 tick released.  Gives the engine
-    # enough time to register charge > 0 before the next release.
-    cycle = tick - Floor(tick * Float(1.0 / 6.0)) * Float(6.0)
-    release_tick = CompareFloats(cycle, Float(5.0), ">=")
+    # 3-tick cycle while charge is 0: 2 ticks pressed, 1 tick released.
+    # The 2 consecutive ON ticks let charge register > 0 before the next
+    # release; once charging is underway the button holds continuously.
+    cycle = tick - Floor(tick * Float(1.0 / 3.0)) * Float(3.0)
+    release_tick = CompareFloats(cycle, Float(2.0), ">=")
 
     # Engine interact state machine:
     #   1. Press interact → pickup/tackle (rising edge, fires once)
