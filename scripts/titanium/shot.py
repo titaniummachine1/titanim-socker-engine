@@ -66,9 +66,15 @@ def clear_shot(
     dir_r, _ = post_tangent(shot_origin, opp_right_post, POST_AIM_RADIUS)
 
     half_angles = [opponent_half_angle(o, shot_origin, r_eff) for o in opponents]
+    # Skip defenders further from the destination than the ball: the ball
+    # reaches the goal before they can catch up.  Margin = interaction
+    # radius + small epsilon.
+    margin = r_eff + Float(0.1)
+    d_to_goal = Distance(shot_origin, opp_goal)
     invariants = [
         opponent_invariants(o, shot_origin, r_eff, ha)
         for o, ha in zip(opponents, half_angles)
+        if Not(CompareFloats(Distance(o, opp_goal), d_to_goal + margin, ">"))
     ]
 
     def viable(cand):
@@ -121,9 +127,14 @@ def clear_pass(origin, mate, opponents, r_eff, direction_ok=None):
     it. `titanium.anti_tackle.aim_is_safe` supplies that test.
     """
     direction = unit_or_zero(mate - origin)
+    # Skip defenders further from the pass target than the ball: they cannot
+    # intercept a kicked ball that reaches the teammate first.
+    margin = r_eff + Float(0.1)
+    d_to_mate = Distance(origin, mate)
     invariants = [
         opponent_invariants(o, origin, r_eff, opponent_half_angle(o, origin, r_eff))
         for o in opponents
+        if Not(CompareFloats(Distance(o, mate), d_to_mate + margin, ">"))
     ]
     legal = is_legal_direction(direction, invariants)
     return legal if direction_ok is None else And(legal, direction_ok(direction))

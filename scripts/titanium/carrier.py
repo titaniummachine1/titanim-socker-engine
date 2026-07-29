@@ -46,13 +46,16 @@ def build_carrier_move(
 
     aimable = anti_tackle.aim_is_safe(me, opponents, r_int, my_stam)
 
+    # Shot: try center, left post, right post — no aim safety gate.
+    # The aim safety check blocks legitimate shots when opponents are near
+    # the carrier but not in the shot lane.
     lane_ok, aim = clear_shot(
         me, opp_goal, opp_left_post, opp_right_post, opponents, r_eff,
-        direction_ok=aimable,
     )
     ready = CompareFloats(charge, Float(FULL_CHARGE), ">=")
     walk_in_now = And(has_ball, walk_in_open)
-    shoot_now = And(has_ball, And(Not(walk_in_now), And(lane_ok, ready)))
+    # Shoot takes priority over walk-in: a shot is faster and harder to stop.
+    shoot_now = And(has_ball, And(lane_ok, ready))
 
     danger = And(
         has_ball,
@@ -78,11 +81,11 @@ def build_carrier_move(
         at_debug = None
         urgent = danger
 
-    # Coverage-based pass: pass to furthest-forward open teammate who can
-    # receive without interception. Only pass if teammate is less covered
-    # than the carrier.
+    # Coverage-based pass: if carrier can't shoot, pass to a teammate who can.
+    # Check if any teammate has a clear shot lane — prefer those furthest forward.
     can_pass, pass_dir, _pass_mate, _pass_cov = formation.best_formation_pass(
-        me, mates, opponents, opp_goal, r_int, r_eff, my_stam
+        me, mates, opponents, opp_goal, r_int, r_eff, my_stam,
+        opp_left_post=opp_left_post, opp_right_post=opp_right_post,
     )
     # Kick can still get the ball out → never teammate-tackle.
     kick_escape = And(ready, can_pass)
@@ -107,6 +110,7 @@ def build_carrier_move(
     )
 
     if WITH_ANTI_TACKLE:
+        # Pass when carrier can't shoot but a teammate has a clear lane.
         pass_now = And(
             has_ball,
             And(ready, And(can_pass, And(Not(shoot_now), Not(instant_now)))),
@@ -123,20 +127,20 @@ def build_carrier_move(
     else:
         pass_now = And(
             has_ball,
-            And(ready, And(can_pass, And(danger, And(Not(shoot_now), Not(instant_now))))),
+            And(ready, And(can_pass, And(Not(shoot_now), Not(instant_now)))),
         )
 
-    release_now = And(Not(walk_in_now), Or(shoot_now, pass_now))
+    release_now = Or(shoot_now, pass_now)
     shoot_to = me + aim * Float(10)
     pass_to = me + pass_dir * Float(10)
     inst_to = me + inst_dir * Float(10)
-    move = ConditionalSetVector3(shoot_now, shoot_to, walk)
-    move = ConditionalSetVector3(pass_now, pass_to, move)
-    move = ConditionalSetVector3(instant_now, inst_to, move)
+    # Move priority: last true condition wins. Shot must be last so the
+    # carrier aims at the shot target when releasing the kick.
+    move = ConditionalSetVector3(in_scoring_range, score_walk, walk)
     move = ConditionalSetVector3(walk_in_now, walk_in_target, move)
-    # Auto-score: override everything (including AT) when in scoring range.
-    # Walk straight at the opponent goal — never at our own goal.
-    move = ConditionalSetVector3(in_scoring_range, score_walk, move)
+    move = ConditionalSetVector3(instant_now, inst_to, move)
+    move = ConditionalSetVector3(pass_now, pass_to, move)
+    move = ConditionalSetVector3(shoot_now, shoot_to, move)
     chase = walk_target(me, ball, step=8.0)
     move = ConditionalSetVector3(has_ball, move, chase)
     return move, release_now, {

@@ -22,9 +22,9 @@ Pass logic:
 from __future__ import annotations
 
 from titanium._env import *  # noqa: F401,F403
-from titanium.constants import HOLD_OFFSET
+from titanium.constants import HOLD_OFFSET, GOAL_HALF_WIDTH
 from titanium.geometry import unit_or_zero
-from titanium.shot import clear_pass
+from titanium.shot import clear_pass, clear_shot
 
 
 def t_formation_stations(carrier, opp_goal, r_int, team_goal=None):
@@ -106,14 +106,16 @@ def best_formation_pass(
     r_eff,
     my_stam,
     direction_ok=None,
+    opp_left_post=None,
+    opp_right_post=None,
 ):
-    """Coverage-based pass selection following the T-formation rules.
+    """Coverage-based pass selection: if carrier can't shoot, pass to a
+    teammate who can. Falls back to open teammates, then any clear lane.
 
-    1. Find all teammates who are open and have a clear pass lane.
-    2. Among those, pick the one furthest forward (closest to opp goal).
-    3. If none open, pick the teammate closest to opp goal with a clear lane.
-    4. If carrier is less covered than all passable teammates, don't pass
-       (return can_pass=False).
+    Priority:
+    1. Teammate with a clear shot lane to goal (furthest forward first).
+    2. Open teammate with clear pass lane (furthest forward first).
+    3. Any teammate with clear pass lane (closest to goal).
 
     Returns (can_pass, aim_dir, mate_pos, mate_coverage).
     """
@@ -127,14 +129,21 @@ def best_formation_pass(
     best_cov = Float(1.0)
     any_ok = Bool(False)
     any_open_ok = Bool(False)
+    any_shooter_ok = Bool(False)
 
-    # First pass: find open teammates with clear pass, pick furthest forward
+    # Tier 1: teammate who can shoot
+    shoot_best_mate = teammates[0]
+    shoot_best_dir = unit_or_zero(teammates[0] - carrier)
+    shoot_best_d = Float(1e9)
+    shoot_best_cov = Float(1.0)
+
+    # Tier 2: open teammate with clear pass
     open_best_mate = teammates[0]
     open_best_dir = unit_or_zero(teammates[0] - carrier)
     open_best_d = Float(1e9)
     open_best_cov = Float(0.0)
 
-    # Second pass: if no open teammate, find any clear-pass teammate closest to goal
+    # Tier 3: any teammate with clear pass
     any_best_mate = teammates[0]
     any_best_dir = unit_or_zero(teammates[0] - carrier)
     any_best_d = Float(1e9)
@@ -146,7 +155,26 @@ def best_formation_pass(
         mate_cov = player_coverage(mate, opponents, r_int, my_stam, opp_staminas)
         mate_open = CompareFloats(mate_cov, Float(0.0), "<=")
 
-        # Track best open+clear teammate (furthest forward = min dist to goal)
+        # Check if this teammate can shoot at goal
+        mate_can_shoot = Bool(False)
+        if opp_left_post is not None and opp_right_post is not None:
+            mate_lane, _ = clear_shot(
+                mate, opp_goal, opp_left_post, opp_right_post, opponents, r_eff,
+            )
+            mate_can_shoot = mate_lane
+
+        # Tier 1: can shoot + clear pass → furthest forward
+        shoot_better = And(
+            And(ok, mate_can_shoot),
+            Or(Not(any_shooter_ok), CompareFloats(d_to_goal, shoot_best_d, "<")),
+        )
+        shoot_best_mate = ConditionalSetVector3(shoot_better, mate, shoot_best_mate)
+        shoot_best_dir = ConditionalSetVector3(shoot_better, unit_or_zero(mate - carrier), shoot_best_dir)
+        shoot_best_d = ConditionalSetFloat(shoot_better, d_to_goal, shoot_best_d)
+        shoot_best_cov = ConditionalSetFloat(shoot_better, mate_cov, shoot_best_cov)
+        any_shooter_ok = Or(any_shooter_ok, And(ok, mate_can_shoot))
+
+        # Tier 2: open + clear pass → furthest forward
         open_better = And(
             And(ok, mate_open),
             Or(Not(any_open_ok), CompareFloats(d_to_goal, open_best_d, "<")),
@@ -157,7 +185,7 @@ def best_formation_pass(
         open_best_cov = ConditionalSetFloat(open_better, mate_cov, open_best_cov)
         any_open_ok = Or(any_open_ok, And(ok, mate_open))
 
-        # Track best any-clear teammate (closest to goal)
+        # Tier 3: any clear pass → closest to goal
         any_better = And(
             ok,
             Or(Not(any_ok), CompareFloats(d_to_goal, any_best_d, "<")),
@@ -168,14 +196,18 @@ def best_formation_pass(
         any_best_cov = ConditionalSetFloat(any_better, mate_cov, any_best_cov)
         any_ok = Or(any_ok, ok)
 
-    # Prefer open teammates; fall back to any clear-pass teammate
-    best_mate = ConditionalSetVector3(any_open_ok, open_best_mate, any_best_mate)
-    best_dir = ConditionalSetVector3(any_open_ok, open_best_dir, any_best_dir)
-    best_d_to_goal = ConditionalSetFloat(any_open_ok, open_best_d, any_best_d)
-    best_cov = ConditionalSetFloat(any_open_ok, open_best_cov, any_best_cov)
+    # Prefer shooter > open > any
+    best_mate = ConditionalSetVector3(any_shooter_ok, shoot_best_mate, any_best_mate)
+    best_dir = ConditionalSetVector3(any_shooter_ok, shoot_best_dir, any_best_dir)
+    best_d_to_goal = ConditionalSetFloat(any_shooter_ok, shoot_best_d, any_best_d)
+    best_cov = ConditionalSetFloat(any_shooter_ok, shoot_best_cov, any_best_cov)
 
-    # Pass whenever carrier is covered (coverage > 0) and a clear lane exists.
-    # Only keep the ball when carrier is fully open (coverage = 0).
+    best_mate = ConditionalSetVector3(any_open_ok, open_best_mate, best_mate)
+    best_dir = ConditionalSetVector3(any_open_ok, open_best_dir, best_dir)
+    best_d_to_goal = ConditionalSetFloat(any_open_ok, open_best_d, best_d_to_goal)
+    best_cov = ConditionalSetFloat(any_open_ok, open_best_cov, best_cov)
+
+    # Pass when carrier is covered and a clear lane exists.
     carrier_covered = CompareFloats(carrier_cov, Float(0.0), ">")
     should_pass = And(any_ok, carrier_covered)
 
