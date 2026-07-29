@@ -178,6 +178,15 @@ def build() -> None:
         ball, opp_left_post, opp_right_post, opponents
     )
 
+    # Defending outlets: when opponent has ball, 2 flankers stay forward as
+    # outlets anchored on the ball (not the team carrier which defaults to GK).
+    # Only slot 3 (trail) stays back on threat_cover.
+    def_fwd = unit_or_zero(opp_goal - ball)
+    def_lat = Vector3(Float(0) - def_fwd.z, Float(0), def_fwd.x)
+    def_left = ball + def_lat * (Float(4.0) * r_int)
+    def_right = ball + def_lat * (Float(0) - Float(4.0) * r_int)
+    def_outlets = [def_left, def_right, None]  # slot 3 = None (stays on defense)
+
     # ONE anti-tackle search shared by support stations + carrier walk + urgency.
     # (Previously rebuilt ~5×: support + urgent + each of 3 outfield carriers.)
     if WITH_ANTI_TACKLE:
@@ -365,6 +374,15 @@ def build() -> None:
         )
         chase_move = ConditionalSetVector3(duty, cutoff, yield_chase)
         move = ConditionalSetVector3(And(opp_has, tackle_chase), chase_move, move)
+        # When defending, non-defender outfielders push forward as flank outlets.
+        # Only slot 3 stays back on threat_cover; slots 1-2 stay forward ready
+        # to receive when we win the ball.
+        if def_outlets[slot - 1] is not None:
+            defending_outlet = And(
+                And(opp_has, Not(has)),
+                And(Not(tackle_chase), Not(walk_in_threat)),
+            )
+            move = ConditionalSetVector3(defending_outlet, def_outlets[slot - 1], move)
         # Attacking: use T-formation stations directly — no collapse.
         # The formation is already spaced (3*r_int L/R, 4*r_int behind carrier)
         # so resolve_space_claims would only pull them out of formation.
@@ -390,10 +408,8 @@ def build() -> None:
                 CompareFloats(d_ball / Float(SPRINT_SPEED), walk_in_score_t, "<="),
             ),
         )
-        sprint = Or(sprint_save_shot, sprint_save_walkin)
-        loose_target = ConditionalSetVector3(
-            sprint_save_shot, meet_point_sprint, meet_point_walk
-        )
+        sprint = Bool(False)
+        loose_target = meet_point_walk
         claim_loose = Or(closest, And(net_shot_threat, i_am_net_saver))
         move = ConditionalSetVector3(And(loose, claim_loose), loose_target, move)
         debug_viz.plot_xz(f"Titanium.P{slot}.Pos", "Cyan", me)

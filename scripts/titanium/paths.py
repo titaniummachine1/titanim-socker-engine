@@ -1,6 +1,7 @@
 """Build/deploy file locations — I/O concern, not gameplay logic."""
 from __future__ import annotations
 
+import sys
 from pathlib import Path
 
 from titanium._env import ROOT
@@ -32,5 +33,9 @@ BACKUPS_DIR = ROOT.parents[0] / "aicomp-soccer-sim" / "data" / "titanium" / "bac
 SAVES_TEST = SAVES.parent / "Titanium_test.txt"
 # Same bytes in the sim repo so watch_bots / headless can load without Unity path.
 LOCAL_TEST = LOCAL_OUT.parent / "Titanium_test.txt"
-# Challenger mirror under Unity Saves (pick "Titanium_challenger" in-game).
-SAVES_CHALLENGER = SAVES.parent / "Titanium_challenger.txt"
+# Challenger mirror under Unity Saves (pick "Titanium_release" in-game).
+# For debug builds, use "Titanium_debug" instead.
+if "--debug" in sys.argv or "--normal" in sys.argv:
+    SAVES_CHALLENGER = SAVES.parent / "Titanium_debug.txt"
+else:
+    SAVES_CHALLENGER = SAVES.parent / "Titanium_release.txt"

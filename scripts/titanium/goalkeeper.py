@@ -221,7 +221,7 @@ def gk_policy(
     dist_gk_threat = Distance(gk, threat_point)
     walk_time_threat = dist_gk_threat / Float(WALK_SPEED)
     walk_cant_make_it = CompareFloats(walk_time_threat, threat_time, ">")
-    sprint = And(is_threat, walk_cant_make_it)
+    sprint = Bool(False)
 
     # Opponent holds the ball: charge-aware press from the carrier BODY
     # (never the held-ball offset — spin would yank the target around),
@@ -237,9 +237,7 @@ def gk_policy(
     move = ConditionalSetVector3(opp_has, press, move)
 
     meet_point_gk = predict_ball_meet_point(gk, ball, ball_vel, WALK_SPEED)
-    meet_point_gk_sprint = predict_ball_meet_point(gk, ball, ball_vel, SPRINT_SPEED)
-    threat_chase = ConditionalSetVector3(sprint, meet_point_gk_sprint, meet_point_gk)
-    move = ConditionalSetVector3(is_threat, threat_chase, move)
+    move = ConditionalSetVector3(is_threat, meet_point_gk, move)
 
     debug = {"is_threat": is_threat, "threat_point": threat_point, "opp_has": opp_has, "press": press, "move": move}
 

@@ -28,7 +28,11 @@ DEBUG_BUILD = "--debug" in sys.argv or "--normal" in sys.argv
 # Default = pylib optimize="release" (DCE + debug-strip). Use --debug only when
 # inspecting TimePlot / DebugDraw sinks.
 EXPLAIN = "--explain" in sys.argv
-CHALLENGER_OUT = CANDIDATE_OUT.parent / "Titanium_challenger.txt"
+# Output names: debug build -> Titanium_debug.txt, release -> Titanium_release.txt
+if DEBUG_BUILD:
+    CHALLENGER_OUT = CANDIDATE_OUT.parent / "Titanium_debug.txt"
+else:
+    CHALLENGER_OUT = CANDIDATE_OUT.parent / "Titanium_release.txt"
 
 def deploy_test_copies(text: str, *, also_challenger_saves: bool | None = None) -> None:
     """Always overwrite Titanium_test for the user to watch — every build/test.
@@ -132,6 +136,8 @@ def write_candidate() -> None:
     print(f"nodes={len(graph_data['serializableNodes'])} conns={len(graph_data['serializableConnections'])}")
     if WITH_ANTI_TACKLE:
         print("  (challenger: binary-search anti_tackle module enabled)")
+    mode_label = "debug" if DEBUG_BUILD else "release"
+    print(f"  (build mode: {mode_label})")
 
     # Always auto-deploy Titanium_test — never leave the user with a stale file.
     deploy_test_copies(out_path.read_text(encoding="utf-8"))
