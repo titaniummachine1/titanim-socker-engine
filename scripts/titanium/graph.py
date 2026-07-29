@@ -365,29 +365,14 @@ def build() -> None:
         )
         chase_move = ConditionalSetVector3(duty, cutoff, yield_chase)
         move = ConditionalSetVector3(And(opp_has, tackle_chase), chase_move, move)
-        # Attacking outlets: mild equal-role spread; collapse toward carrier
-        # when AT demands an emergency handoff.
-        support = positioning.resolve_space_claims(
-            me,
-            raw,
-            peer_bodies,
-            peer_pris,
-            my_pri,
-            r_int,
-            ball=ball,
-            opp_goal=opp_goal,
-            carrier_retreating=carrier_urgent,
-            collapse_ok=carrier_urgent,
-        )
-        move = ConditionalSetVector3(And(team_has, Not(has)), support, move)
+        # Attacking: use T-formation stations directly — no collapse.
+        # The formation is already spaced (3*r_int L/R, 4*r_int behind carrier)
+        # so resolve_space_claims would only pull them out of formation.
+        move = ConditionalSetVector3(And(team_has, Not(has)), raw, move)
         move = ConditionalSetVector3(has, carry, move)
 
-        # Teammate steal only when AT pushback and kick-pass cannot escape.
-        i_am_steal = CompareFloats(Distance(me, steal_target), Float(0.35), "<")
-        instant_steal = And(
-            And(And(team_has, Not(has)), allow_teammate_steal),
-            i_am_steal,
-        )
+        # No teammate steal — never tackle your own carrier.
+        instant_steal = Bool(False)
 
         # Loose / flying ball.
         # Net-bound: only the single fastest saver claims it; sprint only if
