@@ -181,10 +181,14 @@ def build() -> None:
     # Defending outlets: when opponent has ball, 2 flankers stay forward as
     # outlets anchored on the ball (not the team carrier which defaults to GK).
     # Only slot 3 (trail) stays back on threat_cover.
+    # Flank distance scales: 1*r_int near opp goal, 4*r_int at half pitch.
     def_fwd = unit_or_zero(opp_goal - ball)
     def_lat = Vector3(Float(0) - def_fwd.z, Float(0), def_fwd.x)
-    def_left = ball + def_lat * (Float(4.0) * r_int)
-    def_right = ball + def_lat * (Float(0) - Float(4.0) * r_int)
+    def_dist = Distance(ball, opp_goal)
+    def_frac = ClampFloat(def_dist / Float(40.0), Float(0.0), Float(1.0))
+    def_scale = Float(1.0) + Float(3.0) * def_frac
+    def_left = ball + def_lat * (def_scale * r_int)
+    def_right = ball + def_lat * (Float(0) - def_scale * r_int)
     def_outlets = [def_left, def_right, None]  # slot 3 = None (stays on defense)
 
     # ONE anti-tackle search shared by support stations + carrier walk + urgency.

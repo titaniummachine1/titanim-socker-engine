@@ -31,8 +31,10 @@ def t_formation_stations(carrier, opp_goal, r_int):
     """T-formation stations relative to the carrier.
 
     Returns (left, right, rear) positions:
-      - left:  4 * r_int to the carrier's left (perpendicular to attack dir)
-      - right: 4 * r_int to the carrier's right
+      - left/right: scale from 1*r_int (at opp goal) to 4*r_int (at half
+        pitch / 40 units away), capped at 4*r_int. Near the goal the
+        flankers collapse in tight (tackle distance); at midfield they
+        spread wide for passing lanes.
       - rear:  4 * r_int behind the carrier (toward own goal)
 
     The formation rotates with the attack direction, so "left" and "right"
@@ -41,8 +43,13 @@ def t_formation_stations(carrier, opp_goal, r_int):
     fwd = unit_or_zero(opp_goal - carrier)
     lat = Vector3(Float(0) - fwd.z, Float(0), fwd.x)
 
-    left = carrier + lat * (Float(4.0) * r_int)
-    right = carrier + lat * (Float(0) - Float(4.0) * r_int)
+    dist_to_goal = Distance(carrier, opp_goal)
+    half_pitch = Float(40.0)
+    frac = ClampFloat(dist_to_goal / half_pitch, Float(0.0), Float(1.0))
+    flank_scale = Float(1.0) + Float(3.0) * frac  # 1..4
+
+    left = carrier + lat * (flank_scale * r_int)
+    right = carrier + lat * (Float(0) - flank_scale * r_int)
     rear = carrier + fwd * (Float(0) - Float(4.0) * r_int)
 
     return left, right, rear
